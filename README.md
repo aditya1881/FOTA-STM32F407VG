@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # OTA Update over CAN (STM32F407)
 
 This project demonstrates a college-level OTA firmware update system over CAN using STM32F407.
@@ -198,3 +199,7 @@ This implementation is intentionally medium-level and suitable for college demon
 - practical bootloader jump handling
 
 For production systems, add stronger security (signed images, anti-rollback, encryption, watchdog-safe state machine, power-fail recovery hardening).
+=======
+# FOTA-STM32F407VGT6
+this project demontrates the  "Secure OTA Firmware Management System for CAN-Based ECU Networks"
+>>>>>>> a060dcd9aaabe4da4eb6de52858f8e4f63f161fe
