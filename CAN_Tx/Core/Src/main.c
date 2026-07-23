@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "flash_if.h"
 
 /* USER CODE END Includes */
@@ -72,6 +74,13 @@
 #define OTA_SEND_END_TIMEOUT_MS   1500U
 #define OTA_SEND_FRAME_RETRY_MAX  3U
 #define OTA_REPLY_QUEUE_LEN       8U
+#define SIM7670_APN               "internet"
+#define SIM7670_DEFAULT_URL       "https://raw.githubusercontent.com/aditya1881/FOTA-STM32F407VG/main/CAN_Rx/build/CAN_Rx.bin"
+#define SIM7670_DEFAULT_MANIFEST_URL "https://raw.githubusercontent.com/aditya1881/FOTA-STM32F407VG/main/CAN_Rx/build/manifest.txt"
+#define SIM7670_CMD_TIMEOUT_MS    5000U
+#define SIM7670_HTTP_TIMEOUT_MS   60000U
+#define SIM7670_HTTP_CHUNK_SIZE   256U
+#define SIM7670_MANIFEST_MAX_BYTES 1024U
 #define LED_TX_Pin                GPIO_PIN_12
 #define LED_RX_Pin                GPIO_PIN_15
 #define LED_ERROR_Pin             GPIO_PIN_14
@@ -128,6 +137,7 @@ static bool UserButtonPressed(void)
 CAN_HandleTypeDef hcan1;
 
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 static CAN_TxHeaderTypeDef canTxHeader;
@@ -156,6 +166,12 @@ static uint8_t otaChunkLength;
 static uint16_t otaDataSeq;
 static volatile uint8_t otaTransferAborted;
 static uint8_t buttonLatched;
+static char simFirmwareUrl[192] = SIM7670_DEFAULT_URL;
+static char simManifestUrl[192] = SIM7670_DEFAULT_MANIFEST_URL;
+static uint32_t simManifestVersion;
+static uint32_t simManifestSize;
+static uint32_t simManifestCrc;
+static uint8_t simManifestValid;
 
 /* USER CODE END PV */
 
@@ -164,6 +180,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void CAN_App_Init(void);
 static void Debug_PrintLine(const char *line);
@@ -190,6 +207,18 @@ static uint8_t OTA_WaitForAckNack(uint32_t timeoutMs, uint8_t *code, uint32_t *v
 static uint8_t OTA_SendFrameWithRetry(uint32_t stdId, const uint8_t *data, uint8_t dlc, uint8_t maxRetries, uint32_t timeoutMs, uint8_t ignoreProtocolNack, uint8_t *nackCode, uint32_t *nackValue);
 static void OTA_SendStoredImageOverCan(void);
 static uint8_t OTA_SendFrame(uint32_t stdId, const uint8_t *data, uint8_t dlc);
+static int32_t SIM7670_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs);
+static int32_t UART2_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs);
+static uint8_t SIM7670_SendCmdExpectOk(const char *cmd, uint32_t timeoutMs);
+static uint8_t SIM7670_WaitForHttpAction(uint16_t *httpCode, uint32_t *contentLen, uint32_t timeoutMs);
+static uint8_t SIM7670_ParseHttpReadHeader(const char *line, uint32_t *dataLen);
+static uint8_t SIM7670_ReadHttpChunk(uint32_t offset, uint32_t req, uint8_t *dataBuf, uint32_t *got);
+static uint8_t SIM7670_HttpGetToBuffer(const char *url, uint8_t *buffer, uint32_t bufferMax, uint32_t *outLen);
+static uint8_t SIM7670_ParseManifest(const uint8_t *buffer, uint32_t length, uint32_t *version, uint32_t *size, uint32_t *crc, char *urlOut, uint32_t urlOutSize);
+static uint8_t SIM7670_FetchManifest(void);
+static void SIM7670_PrintManifestStatus(void);
+static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expectedSize, uint32_t expectedCrc);
+static uint8_t SIM7670_CheckReady(void);
 
 /* USER CODE END PFP */
 
@@ -229,11 +258,17 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_USART2_UART_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   CAN_App_Init();
   Debug_PrintLine("CAN debug UART ready\r\n");
   Debug_PrintLine("CAN OTA TX node ready. NODE=" XSTR(CAN_NODE_ID) "\r\n");
   Debug_PrintLine("UART header format: [magic OTA1][size u32 LE][crc32 u32 LE]\r\n");
+  Debug_PrintLine("UART cmd 'G': download firmware via SIM7670 and store\r\n");
+  Debug_PrintLine("UART cmd 'R': check SIM7670 AT response\r\n");
+  Debug_PrintLine("UART cmd 'W': set firmware URL\r\n");
+  Debug_PrintLine("UART cmd 'T': set manifest URL\r\n");
+  Debug_PrintLine("UART cmd 'M': fetch manifest (version,size,crc,url)\r\n");
 
   OTA_AppInit();
 
@@ -390,6 +425,38 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 2 */
 
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
 }
 
 /**
@@ -1042,6 +1109,95 @@ static void OTA_ProcessUartInput(void)
       return;
     }
 
+    if (rxByte == 'R')
+    {
+      if (SIM7670_CheckReady() != 0U)
+      {
+        Debug_PrintLine("SIM7670 ready\r\n");
+      }
+      else
+      {
+        Debug_PrintLine("SIM7670 not responding\r\n");
+      }
+      return;
+    }
+
+    if (rxByte == 'W')
+    {
+      char input[192];
+      Debug_PrintLine("Enter firmware URL then newline:\r\n");
+      if (UART2_ReadLine(input, sizeof(input), 30000U) > 0)
+      {
+        strncpy(simFirmwareUrl, input, sizeof(simFirmwareUrl) - 1U);
+        simFirmwareUrl[sizeof(simFirmwareUrl) - 1U] = '\0';
+        Debug_PrintLine("Firmware URL updated\r\n");
+      }
+      else
+      {
+        Debug_PrintLine("URL input timeout\r\n");
+      }
+      return;
+    }
+
+    if (rxByte == 'T')
+    {
+      char input[192];
+      Debug_PrintLine("Enter manifest URL then newline:\r\n");
+      if (UART2_ReadLine(input, sizeof(input), 30000U) > 0)
+      {
+        strncpy(simManifestUrl, input, sizeof(simManifestUrl) - 1U);
+        simManifestUrl[sizeof(simManifestUrl) - 1U] = '\0';
+        Debug_PrintLine("Manifest URL updated\r\n");
+      }
+      else
+      {
+        Debug_PrintLine("Manifest URL input timeout\r\n");
+      }
+      return;
+    }
+
+    if (rxByte == 'M')
+    {
+      if (SIM7670_FetchManifest() != 0U)
+      {
+        SIM7670_PrintManifestStatus();
+      }
+      else
+      {
+        Debug_PrintLine("Manifest fetch failed\r\n");
+      }
+      return;
+    }
+
+    if (rxByte == 'G')
+    {
+      char line[240];
+
+      if (SIM7670_FetchManifest() != 0U)
+      {
+        SIM7670_PrintManifestStatus();
+      }
+      else
+      {
+        Debug_PrintLine("Manifest not available, using direct firmware URL\r\n");
+      }
+
+      snprintf(line, sizeof(line), "Downloading URL: %s\r\n", simFirmwareUrl);
+      Debug_PrintLine(line);
+      if (SIM7670_DownloadToStoredPartition(simFirmwareUrl,
+                                             (simManifestValid != 0U) ? simManifestSize : 0U,
+                                             (simManifestValid != 0U) ? simManifestCrc : 0U) != 0U)
+      {
+        Debug_PrintLine("SIM download and store complete\r\n");
+        Debug_PrintLine("Send 'S' or press button for OTA\r\n");
+      }
+      else
+      {
+        Debug_PrintLine("SIM download failed\r\n");
+      }
+      return;
+    }
+
     otaHeaderBuffer[otaHeaderIndex++] = rxByte;
     if (otaHeaderIndex >= OTA_UART_HEADER_SIZE)
     {
@@ -1281,6 +1437,693 @@ static void OTA_SendStoredImageOverCan(void)
   }
 
   Debug_PrintLine("Stored image OTA transfer complete\r\n");
+}
+
+static int32_t SIM7670_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs)
+{
+  uint32_t startTick = HAL_GetTick();
+  uint32_t index = 0U;
+  uint8_t ch;
+
+  if ((line == NULL) || (lineSize < 2U))
+  {
+    return -1;
+  }
+
+  while ((HAL_GetTick() - startTick) < timeoutMs)
+  {
+    if (HAL_UART_Receive(&huart3, &ch, 1U, 10U) != HAL_OK)
+    {
+      continue;
+    }
+
+    if (ch == '\r')
+    {
+      continue;
+    }
+
+    if (ch == '\n')
+    {
+      if (index == 0U)
+      {
+        continue;
+      }
+
+      line[index] = '\0';
+      return (int32_t)index;
+    }
+
+    if (index < (lineSize - 1U))
+    {
+      line[index++] = (char)ch;
+    }
+  }
+
+  return -1;
+}
+
+static int32_t UART2_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs)
+{
+  uint32_t startTick = HAL_GetTick();
+  uint32_t index = 0U;
+  uint8_t ch;
+
+  if ((line == NULL) || (lineSize < 2U))
+  {
+    return -1;
+  }
+
+  while ((HAL_GetTick() - startTick) < timeoutMs)
+  {
+    if (HAL_UART_Receive(&huart2, &ch, 1U, 10U) != HAL_OK)
+    {
+      continue;
+    }
+
+    if (ch == '\r')
+    {
+      continue;
+    }
+
+    if (ch == '\n')
+    {
+      if (index == 0U)
+      {
+        continue;
+      }
+      line[index] = '\0';
+      return (int32_t)index;
+    }
+
+    if (index < (lineSize - 1U))
+    {
+      line[index++] = (char)ch;
+      (void)HAL_UART_Transmit(&huart2, &ch, 1U, 20U);
+    }
+  }
+
+  return -1;
+}
+
+static uint8_t SIM7670_SendCmdExpectOk(const char *cmd, uint32_t timeoutMs)
+{
+  char tx[192];
+  char line[192];
+  uint32_t startTick = HAL_GetTick();
+
+  if (cmd == NULL)
+  {
+    return 0U;
+  }
+
+  (void)snprintf(tx, sizeof(tx), "%s\r\n", cmd);
+  if (HAL_UART_Transmit(&huart3, (uint8_t *)tx, (uint16_t)strlen(tx), 500U) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  while ((HAL_GetTick() - startTick) < timeoutMs)
+  {
+    int32_t len = SIM7670_ReadLine(line, sizeof(line), timeoutMs);
+    if (len <= 0)
+    {
+      continue;
+    }
+
+    if (strcmp(line, "OK") == 0)
+    {
+      return 1U;
+    }
+
+    if (strstr(line, "ERROR") != NULL)
+    {
+      return 0U;
+    }
+  }
+
+  return 0U;
+}
+
+static uint8_t SIM7670_WaitForHttpAction(uint16_t *httpCode, uint32_t *contentLen, uint32_t timeoutMs)
+{
+  char line[192];
+  uint32_t startTick = HAL_GetTick();
+
+  while ((HAL_GetTick() - startTick) < timeoutMs)
+  {
+    int32_t len = SIM7670_ReadLine(line, sizeof(line), timeoutMs);
+    unsigned int method = 0U;
+    unsigned int status = 0U;
+    unsigned long length = 0UL;
+
+    if (len <= 0)
+    {
+      continue;
+    }
+
+    if (sscanf(line, "+HTTPACTION: %u,%u,%lu", &method, &status, &length) == 3)
+    {
+      if (httpCode != NULL)
+      {
+        *httpCode = (uint16_t)status;
+      }
+
+      if (contentLen != NULL)
+      {
+        *contentLen = (uint32_t)length;
+      }
+
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
+static uint8_t SIM7670_ParseHttpReadHeader(const char *line, uint32_t *dataLen)
+{
+  const char *p;
+  const char *end;
+  const char *start;
+  unsigned long parsed;
+
+  if ((line == NULL) || (dataLen == NULL))
+  {
+    return 0U;
+  }
+
+  if (strstr(line, "+HTTPREAD") == NULL)
+  {
+    return 0U;
+  }
+
+  end = line + strlen(line);
+  p = end;
+  while ((p > line) && !isdigit((unsigned char)p[-1]))
+  {
+    p--;
+  }
+
+  start = p;
+  while ((start > line) && isdigit((unsigned char)start[-1]))
+  {
+    start--;
+  }
+
+  if (start == p)
+  {
+    return 0U;
+  }
+
+  parsed = strtoul(start, NULL, 10);
+  *dataLen = (uint32_t)parsed;
+  return 1U;
+}
+
+static uint8_t SIM7670_ReadHttpChunk(uint32_t offset, uint32_t req, uint8_t *dataBuf, uint32_t *got)
+{
+  char cmd[64];
+  char line[192];
+  uint32_t lineDeadline = HAL_GetTick() + SIM7670_CMD_TIMEOUT_MS;
+  uint32_t payloadLen = 0U;
+
+  if ((dataBuf == NULL) || (got == NULL) || (req == 0U))
+  {
+    return 0U;
+  }
+
+  snprintf(cmd, sizeof(cmd), "AT+HTTPREAD=%lu,%lu\r\n", (unsigned long)offset, (unsigned long)req);
+  if (HAL_UART_Transmit(&huart3, (uint8_t *)cmd, (uint16_t)strlen(cmd), 500U) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  while ((int32_t)(lineDeadline - HAL_GetTick()) > 0)
+  {
+    int32_t len = SIM7670_ReadLine(line, sizeof(line), 500U);
+    if (len <= 0)
+    {
+      continue;
+    }
+
+    if (SIM7670_ParseHttpReadHeader(line, &payloadLen) != 0U)
+    {
+      break;
+    }
+
+    if (strstr(line, "ERROR") != NULL)
+    {
+      return 0U;
+    }
+  }
+
+  if ((payloadLen == 0U) || (payloadLen > req))
+  {
+    return 0U;
+  }
+
+  if (HAL_UART_Receive(&huart3, dataBuf, (uint16_t)payloadLen, SIM7670_CMD_TIMEOUT_MS) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  /* Drain trailing blank/OK lines if present in this modem FW variant. */
+  (void)SIM7670_ReadLine(line, sizeof(line), 300U);
+  (void)SIM7670_ReadLine(line, sizeof(line), 300U);
+
+  *got = payloadLen;
+  return 1U;
+}
+
+static uint8_t SIM7670_HttpGetToBuffer(const char *url, uint8_t *buffer, uint32_t bufferMax, uint32_t *outLen)
+{
+  char cmd[256];
+  uint16_t httpCode = 0U;
+  uint32_t contentLen = 0U;
+  uint32_t offset = 0U;
+
+  if ((url == NULL) || (buffer == NULL) || (outLen == NULL) || (bufferMax == 0U))
+  {
+    return 0U;
+  }
+
+  if (SIM7670_CheckReady() == 0U)
+  {
+    return 0U;
+  }
+
+  (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", SIM7670_APN);
+  if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    return 0U;
+  }
+
+  (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+  if (SIM7670_SendCmdExpectOk("AT+HTTPINIT", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    return 0U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",1", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  (void)snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url);
+  if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("AT+HTTPACTION=0", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if (SIM7670_WaitForHttpAction(&httpCode, &contentLen, SIM7670_HTTP_TIMEOUT_MS) == 0U)
+  {
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if ((httpCode != 200U) || (contentLen == 0U) || (contentLen > bufferMax))
+  {
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  while (offset < contentLen)
+  {
+    uint32_t req = contentLen - offset;
+    uint32_t got = 0U;
+
+    if (req > SIM7670_HTTP_CHUNK_SIZE)
+    {
+      req = SIM7670_HTTP_CHUNK_SIZE;
+    }
+
+    if (SIM7670_ReadHttpChunk(offset, req, &buffer[offset], &got) == 0U)
+    {
+      (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+      return 0U;
+    }
+
+    offset += got;
+  }
+
+  (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+  *outLen = contentLen;
+  return 1U;
+}
+
+static uint8_t SIM7670_ParseManifest(const uint8_t *buffer, uint32_t length, uint32_t *version, uint32_t *size, uint32_t *crc, char *urlOut, uint32_t urlOutSize)
+{
+  char text[SIM7670_MANIFEST_MAX_BYTES + 1U];
+  char *p;
+  uint8_t foundSize = 0U;
+  uint8_t foundCrc = 0U;
+  uint8_t foundUrl = 0U;
+
+  if ((buffer == NULL) || (length == 0U) || (length > SIM7670_MANIFEST_MAX_BYTES) ||
+      (size == NULL) || (crc == NULL))
+  {
+    return 0U;
+  }
+
+  memcpy(text, buffer, length);
+  text[length] = '\0';
+
+  p = strstr(text, "version");
+  if ((p != NULL) && (version != NULL))
+  {
+    while ((*p != '\0') && (*p != ':') && (*p != '='))
+    {
+      p++;
+    }
+    if ((*p == ':') || (*p == '='))
+    {
+      p++;
+      *version = (uint32_t)strtoul(p, NULL, 0);
+    }
+  }
+
+  p = strstr(text, "size");
+  if (p != NULL)
+  {
+    while ((*p != '\0') && (*p != ':') && (*p != '='))
+    {
+      p++;
+    }
+    if ((*p == ':') || (*p == '='))
+    {
+      p++;
+      *size = (uint32_t)strtoul(p, NULL, 0);
+      foundSize = 1U;
+    }
+  }
+
+  p = strstr(text, "crc");
+  if (p != NULL)
+  {
+    while ((*p != '\0') && (*p != ':') && (*p != '='))
+    {
+      p++;
+    }
+    if ((*p == ':') || (*p == '='))
+    {
+      p++;
+      while ((*p == ' ') || (*p == '"'))
+      {
+        p++;
+      }
+      *crc = (uint32_t)strtoul(p, NULL, 0);
+      foundCrc = 1U;
+    }
+  }
+
+  p = strstr(text, "url");
+  if ((p != NULL) && (urlOut != NULL) && (urlOutSize >= 8U))
+  {
+    char *q;
+    while ((*p != '\0') && (*p != ':') && (*p != '='))
+    {
+      p++;
+    }
+    if ((*p == ':') || (*p == '='))
+    {
+      p++;
+      while ((*p == ' ') || (*p == '"'))
+      {
+        p++;
+      }
+      q = p;
+      while ((*q != '\0') && (*q != '"') && (*q != '\r') && (*q != '\n'))
+      {
+        q++;
+      }
+      if (q > p)
+      {
+        uint32_t len = (uint32_t)(q - p);
+        if (len >= urlOutSize)
+        {
+          len = urlOutSize - 1U;
+        }
+        memcpy(urlOut, p, len);
+        urlOut[len] = '\0';
+        foundUrl = 1U;
+      }
+    }
+  }
+
+  if ((urlOut != NULL) && (urlOutSize >= 1U) && (foundUrl == 0U))
+  {
+    urlOut[0] = '\0';
+  }
+
+  return (uint8_t)((foundSize != 0U) && (foundCrc != 0U));
+}
+
+static uint8_t SIM7670_FetchManifest(void)
+{
+  uint8_t manifestBuf[SIM7670_MANIFEST_MAX_BYTES];
+  uint32_t manifestLen = 0U;
+  uint32_t version = 0U;
+  uint32_t size = 0U;
+  uint32_t crc = 0U;
+  char url[192] = {0};
+
+  if (SIM7670_HttpGetToBuffer(simManifestUrl, manifestBuf, sizeof(manifestBuf), &manifestLen) == 0U)
+  {
+    simManifestValid = 0U;
+    return 0U;
+  }
+
+  if (SIM7670_ParseManifest(manifestBuf, manifestLen, &version, &size, &crc, url, sizeof(url)) == 0U)
+  {
+    simManifestValid = 0U;
+    return 0U;
+  }
+
+  simManifestVersion = version;
+  simManifestSize = size;
+  simManifestCrc = crc;
+  if (url[0] != '\0')
+  {
+    strncpy(simFirmwareUrl, url, sizeof(simFirmwareUrl) - 1U);
+    simFirmwareUrl[sizeof(simFirmwareUrl) - 1U] = '\0';
+  }
+  simManifestValid = 1U;
+  return 1U;
+}
+
+static void SIM7670_PrintManifestStatus(void)
+{
+  char line[256];
+  if (simManifestValid == 0U)
+  {
+    Debug_PrintLine("Manifest: invalid\r\n");
+    return;
+  }
+
+  snprintf(line, sizeof(line), "Manifest v=%lu size=%lu crc=0x%08lX\r\n",
+           (unsigned long)simManifestVersion,
+           (unsigned long)simManifestSize,
+           (unsigned long)simManifestCrc);
+  Debug_PrintLine(line);
+
+  if (simFirmwareUrl[0] != '\0')
+  {
+    snprintf(line, sizeof(line), "Manifest URL: %s\r\n", simFirmwareUrl);
+    Debug_PrintLine(line);
+  }
+}
+
+static uint8_t SIM7670_CheckReady(void)
+{
+  if (SIM7670_SendCmdExpectOk("AT", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    return 0U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("ATE0", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
+static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expectedSize, uint32_t expectedCrc)
+{
+  char cmd[256];
+  uint16_t httpCode = 0U;
+  uint32_t contentLen = 0U;
+  uint32_t offset = 0U;
+  uint32_t writeAddress = OTA_STORED_IMAGE_ADDRESS + OTA_STORED_HEADER_SIZE;
+  uint32_t runningCrc = 0xFFFFFFFFU;
+
+  if ((url == NULL) || (url[0] == '\0'))
+  {
+    Debug_PrintLine("SIM URL empty\r\n");
+    return 0U;
+  }
+
+  if (SIM7670_CheckReady() == 0U)
+  {
+    Debug_PrintLine("SIM AT init failed\r\n");
+    return 0U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("AT+CPIN?", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    Debug_PrintLine("SIM not ready (CPIN)\r\n");
+    return 0U;
+  }
+
+  (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", SIM7670_APN);
+  if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    Debug_PrintLine("SIM APN setup failed\r\n");
+    return 0U;
+  }
+
+  (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+  if (SIM7670_SendCmdExpectOk("AT+HTTPINIT", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    Debug_PrintLine("SIM HTTPINIT failed\r\n");
+    return 0U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",1", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    Debug_PrintLine("SIM HTTP CID failed\r\n");
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  (void)snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url);
+  if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    Debug_PrintLine("SIM HTTP URL set failed\r\n");
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("AT+HTTPACTION=0", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  {
+    Debug_PrintLine("SIM HTTPACTION failed\r\n");
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if (SIM7670_WaitForHttpAction(&httpCode, &contentLen, SIM7670_HTTP_TIMEOUT_MS) == 0U)
+  {
+    Debug_PrintLine("SIM HTTPACTION timeout\r\n");
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if ((httpCode != 200U) || (contentLen == 0U) || (contentLen > OTA_MAX_IMAGE_SIZE))
+  {
+    char failLine[96];
+    snprintf(failLine, sizeof(failLine), "HTTP status=%u len=%lu invalid\r\n",
+             (unsigned int)httpCode,
+             (unsigned long)contentLen);
+    Debug_PrintLine(failLine);
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if (FLASH_If_Erase(OTA_STORED_IMAGE_ADDRESS, OTA_STORED_AREA_SIZE) != 0)
+  {
+    Debug_PrintLine("Flash erase failed before SIM download\r\n");
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  while (offset < contentLen)
+  {
+    uint32_t req = contentLen - offset;
+    uint32_t got;
+    uint32_t i;
+    uint8_t dataBuf[SIM7670_HTTP_CHUNK_SIZE];
+
+    if (req > SIM7670_HTTP_CHUNK_SIZE)
+    {
+      req = SIM7670_HTTP_CHUNK_SIZE;
+    }
+
+    if (SIM7670_ReadHttpChunk(offset, req, dataBuf, &got) == 0U)
+    {
+      Debug_PrintLine("HTTPREAD failed\r\n");
+      (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+      return 0U;
+    }
+
+    if (FLASH_If_Write(writeAddress, dataBuf, got) != 0)
+    {
+      Debug_PrintLine("Flash write failed during SIM download\r\n");
+      (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+      return 0U;
+    }
+
+    for (i = 0U; i < got; i++)
+    {
+      runningCrc = OTA_Crc32Update(runningCrc, dataBuf[i]);
+    }
+
+    writeAddress += got;
+    offset += got;
+
+    if ((offset % (8U * 1024U)) == 0U)
+    {
+      char progressLine[72];
+      snprintf(progressLine, sizeof(progressLine), "SIM download %lu/%lu\r\n",
+               (unsigned long)offset,
+               (unsigned long)contentLen);
+      Debug_PrintLine(progressLine);
+    }
+  }
+
+  if ((expectedSize != 0U) && (contentLen != expectedSize))
+  {
+    Debug_PrintLine("Manifest size mismatch\r\n");
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  if ((expectedCrc != 0U) && ((~runningCrc) != expectedCrc))
+  {
+    Debug_PrintLine("Manifest CRC mismatch\r\n");
+    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+    return 0U;
+  }
+
+  {
+    OtaStoredHeader_t hdr;
+    hdr.magic = OTA_STORED_MAGIC;
+    hdr.size = contentLen;
+    hdr.crc = ~runningCrc;
+    hdr.reserved = 0xFFFFFFFFU;
+
+    if (FLASH_If_Write(OTA_STORED_IMAGE_ADDRESS, (const uint8_t *)&hdr, sizeof(hdr)) != 0)
+    {
+      Debug_PrintLine("Header write failed after SIM download\r\n");
+      (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+      return 0U;
+    }
+
+    stored_image_size = hdr.size;
+    stored_image_crc = hdr.crc;
+  }
+
+  (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+  Debug_PrintLine("SIM download stored successfully\r\n");
+  OTA_PrintStoredImageStatus();
+  return 1U;
 }
 
 /* USER CODE END 4 */

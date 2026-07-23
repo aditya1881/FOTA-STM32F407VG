@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # OTA Update over CAN (STM32F407)
 
 This project demonstrates a college-level OTA firmware update system over CAN using STM32F407.
@@ -7,6 +6,26 @@ It contains 3 firmware projects:
 - `Bootloader`: decides which application slot to boot and safely jumps to app.
 - `CAN_Tx`: OTA sender node (stores image in its own flash and sends to receiver on button press).
 - `CAN_Rx`: OTA receiver node (writes image to non-active slot, validates CRC, updates metadata, reboots).
+
+## Quick Start (Do / Don't)
+
+Do this:
+- Build + flash receiver base using `scripts/flash_all.sh`.
+- Preload sender with Slot-B OTA payload using `scripts/flash_can_tx_with_image.sh`.
+- Use `CAN_Rx_slotB.bin` as OTA image when target slot is B.
+
+Don't do this:
+- Do not pass `CAN_Rx/build/CAN_Rx.bin` as Slot-B OTA payload.
+- Do not mix Slot-A linked image with Slot-B write target.
+
+One-command safe preload:
+
+```bash
+cd scripts
+bash flash_can_tx_with_image.sh
+```
+
+The script validates reset-handler address and aborts if image is not linked for Slot B.
 
 ## 1) High-level Architecture
 
@@ -40,9 +59,9 @@ Frame format:
 - `START` (8 bytes):
   - bytes [0..3] = image size (uint32 LE)
   - bytes [4..7] = CRC32 (uint32 LE)
-- `DATA` (3..8 bytes):
+- `DATA` (6 bytes):
   - bytes [0..1] = sequence number (uint16 LE)
-  - bytes [2..7] = up to 6 payload bytes
+  - bytes [2..5] = 4 payload bytes
 - `END` (8 bytes):
   - bytes [0..3] = footer magic `0x454E4431` (`END1`)
   - bytes [4..7] = image size (uint32 LE)
@@ -93,6 +112,9 @@ make clean all
 cd ../CAN_Rx
 make clean all
 
+# Build receiver image linked for Slot B (required OTA payload for Slot B updates)
+make clean all TARGET=CAN_Rx_slotB LDSCRIPT=STM32F407VGTX_APP_B_FLASH.ld
+
 cd ../CAN_Tx
 make clean all
 ```
@@ -119,6 +141,22 @@ make flash
 
 Or use your own ST-LINK / CubeProgrammer command for `CAN_Tx` ELF.
 
+### Option C: Flash CAN_Tx + preload OTA payload in its storage partition
+
+```bash
+cd scripts
+bash flash_can_tx_with_image.sh
+```
+
+Default behavior:
+- Uses `../CAN_Rx/build/CAN_Rx_slotB.bin` as OTA payload.
+- If missing, builds it automatically using `STM32F407VGTX_APP_B_FLASH.ld`.
+- Flashes `CAN_Tx` app at `0x08000000` and storage image at `0x080E0000`.
+
+Safety check:
+- Script verifies payload reset handler address is in Slot B range (`0x08040001..0x0807FFFF`).
+- If you accidentally pass `../CAN_Rx/build/CAN_Rx.bin` (Slot A linked), script aborts with an error.
+
 ## 7) How to Load Firmware Image into CAN_Tx Flash
 
 `CAN_Tx` supports UART upload command:
@@ -132,6 +170,55 @@ Notes:
 - Keep image size within configured max.
 - Upload binary image (`.bin`) generated from target application.
 
+## 7A) Download Firmware via SIM7670 (New)
+
+Current CAN_Tx firmware now supports downloading the OTA payload over cellular and storing it in partition-2 (`0x080E0000`) without changing CAN_Rx or Bootloader.
+
+Wiring used by firmware:
+- Debug/UART console: `USART2` (`PA2/PA3`) at `115200`
+- SIM7670 modem UART: `USART3` (`PB10 TX`, `PB11 RX`) at `115200`
+
+Runtime UART commands on debug console:
+- `R` : check SIM7670 AT responsiveness (`AT`, `ATE0`)
+- `W` : set firmware URL at runtime (no rebuild)
+- `T` : set manifest URL at runtime (no rebuild)
+- `M` : fetch and parse manifest (size/crc, version optional)
+- `G` : download firmware from URL and store into CAN_Tx storage partition
+- `Q` : print stored image status
+- `S` : send stored image over CAN (existing flow)
+
+Default modem configuration in code (`CAN_Tx/Core/Src/main.c`):
+- `SIM7670_APN` = `internet`
+- `SIM7670_DEFAULT_URL` = `https://raw.githubusercontent.com/aditya1881/FOTA-STM32F407VG/main/CAN_Rx/build/CAN_Rx.bin`
+- `SIM7670_DEFAULT_MANIFEST_URL` = `https://raw.githubusercontent.com/aditya1881/FOTA-STM32F407VG/main/CAN_Rx/build/manifest.txt`
+
+Note: GitHub blob links are not direct binary downloads. The code uses the raw GitHub URL form so SIM7670 can fetch the `.bin` file directly.
+
+You should change `SIM7670_DEFAULT_URL` to your real hosted binary URL (recommended: GitHub Release asset direct URL).
+
+End-to-end with modem:
+1. Power up CAN_Tx with SIM7670 connected on `USART3`.
+2. On debug UART, send `R` and verify `SIM7670 ready`.
+3. Optional: send `T` to set manifest URL and `W` to set fallback direct URL.
+4. Send `M` to fetch manifest and verify printed version/size/crc/url.
+5. Send `G` to download and store firmware into partition-2.
+4. Send `Q` to confirm stored size/CRC.
+5. Send `S` (or press button) to run existing OTA-over-CAN transfer.
+
+Manifest format accepted by current parser:
+- Key-value lines:
+  - `size=14788`
+  - `crc=0x1234ABCD`
+- Optional lines if you want them:
+  - `version=12`
+  - `url=https://.../CAN_Rx_slotB.bin`
+
+`G` behavior:
+- First tries to fetch manifest and use its size/CRC.
+- If manifest fetch fails, falls back to direct firmware URL.
+- If manifest includes a URL, that URL overrides the direct firmware URL.
+- If manifest is available, downloaded binary is checked against manifest size and CRC before storage header is committed.
+
 ## 8) OTA Demo Procedure (End-to-End)
 
 1. Flash receiver board with `Bootloader + CAN_Rx`.
@@ -139,6 +226,7 @@ Notes:
 3. Connect CANH/CANL/GND between boards with proper termination.
 4. Open UART terminal(s) at `115200` baud.
 5. Upload new firmware binary to `CAN_Tx` using UART `U + size + data` protocol.
+  - For a Slot B OTA target, use Slot B linked binary (`CAN_Rx_slotB.bin`).
 6. Press user button on `CAN_Tx`.
 7. Observe logs:
    - `CAN_Tx`: sends SYNC/START/DATA/END and receives ACK.
@@ -176,9 +264,15 @@ Notes:
 - Verify flash sector mapping and image size boundaries.
 - Ensure target slot does not overlap metadata region.
 
-5. Bootloader does not jump:
+5. Bootloader does not jump or rolls back to Slot A:
 - Verify app vector table (initial SP + reset handler) is valid.
 - Verify metadata points to expected slot.
+- Ensure OTA payload is Slot-B linked (`CAN_Rx_slotB.bin`) when writing to Slot B.
+- Do not use `CAN_Rx.bin` as Slot-B OTA payload.
+
+6. Boot jumps but app resets quickly (then rollback):
+- Ensure receiver image sets vector table correctly after jump.
+- Current code sets `SCB->VTOR` to the image vector table in `CAN_Rx/Core/Src/system_stm32f4xx.c`.
 
 ## 11) Important Files
 
@@ -188,6 +282,8 @@ Notes:
 - Sender flash helpers: `CAN_Tx/Core/Src/flash_if.c`
 - Metadata layout: `CAN_Rx/Core/Inc/ota_metadata.h`
 - Build/flash script: `scripts/flash_all.sh`
+- CAN_Tx preload script: `scripts/flash_can_tx_with_image.sh`
+- Slot B linker script: `CAN_Rx/STM32F407VGTX_APP_B_FLASH.ld`
 
 ## 12) Scope and Level
 
@@ -199,7 +295,3 @@ This implementation is intentionally medium-level and suitable for college demon
 - practical bootloader jump handling
 
 For production systems, add stronger security (signed images, anti-rollback, encryption, watchdog-safe state machine, power-fail recovery hardening).
-=======
-# FOTA-STM32F407VGT6
-this project demontrates the  "Secure OTA Firmware Management System for CAN-Based ECU Networks"
->>>>>>> a060dcd9aaabe4da4eb6de52858f8e4f63f161fe

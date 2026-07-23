@@ -32,6 +32,11 @@ pushd "$APP_DIR" >/dev/null
 make clean all
 popd >/dev/null
 
+echo "Generating CAN_Rx manifest..."
+python3 "$WORKSPACE_ROOT/scripts/generate_manifest.py" \
+  --input "$APP_DIR/build/CAN_Rx.bin" \
+  --output "$APP_DIR/build/manifest.txt"
+
 BOOT_ELF="$BOOT_DIR/build/Bootloader.elf"
 APP_ELF="$APP_DIR/build/CAN_Rx.elf"
 
