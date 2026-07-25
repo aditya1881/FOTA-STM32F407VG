@@ -48,6 +48,15 @@
 #define OTA_CAN_ID_END            0x323U
 #define OTA_CAN_ID_ACK            0x324U
 #define OTA_CAN_ID_NACK           0x325U
+#define OTA_CAN_ID_QUERY          0x326U
+#define OTA_CAN_ID_STATUS         0x327U
+
+#define OTA_QUERY_ACTIVE_STATUS   0U
+#define OTA_QUERY_SLOT_A_META     1U
+#define OTA_QUERY_SLOT_B_META     2U
+
+#define OTA_SLOT_A                0U
+#define OTA_SLOT_B                1U
 
 #define OTA_SYNC_TOKEN_0          'O'
 #define OTA_SYNC_TOKEN_1          'T'
@@ -74,9 +83,11 @@
 #define OTA_SEND_END_TIMEOUT_MS   1500U
 #define OTA_SEND_FRAME_RETRY_MAX  3U
 #define OTA_REPLY_QUEUE_LEN       8U
-#define SIM7670_APN               "internet"
-#define SIM7670_DEFAULT_URL       "https://raw.githubusercontent.com/aditya1881/FOTA-STM32F407VG/main/CAN_Rx/build/CAN_Rx.bin"
-#define SIM7670_DEFAULT_MANIFEST_URL "https://raw.githubusercontent.com/aditya1881/FOTA-STM32F407VG/main/CAN_Rx/build/manifest.txt"
+#define SIM7670_APN               "airtelgprs.com"
+#define SIM7670_FIXED_BAUD        115200U
+#define SIM7670_DEFAULT_URL_A      "https://can-rx-firmware-storage.s3.eu-north-1.amazonaws.com/CAN_Rx.bin"
+#define SIM7670_DEFAULT_URL_B      "https://can-firmware-storage.s3.eu-north-1.amazonaws.com/CAN_Rx_slot_b.bin"
+#define SIM7670_DEFAULT_MANIFEST_URL "https://can-firmware-storage.s3.eu-north-1.amazonaws.com/manifest.txt"
 #define SIM7670_CMD_TIMEOUT_MS    5000U
 #define SIM7670_HTTP_TIMEOUT_MS   60000U
 #define SIM7670_HTTP_CHUNK_SIZE   256U
@@ -109,6 +120,24 @@ typedef struct
 // UART upload protocol: send 'U' then 4-byte LE size, then size bytes of data
 static uint32_t stored_image_size = 0;
 static uint32_t stored_image_crc = 0;
+
+typedef struct
+{
+  uint32_t activeSlot;
+  uint32_t bootSlot;
+  uint32_t confirmedSlot;
+  uint32_t updateInProgress;
+  uint32_t bootAttemptCount;
+  uint32_t maxBootAttempts;
+  uint32_t lastErrorCode;
+  uint32_t metadataVersion;
+} OtaRxStatus_t;
+
+typedef struct
+{
+  uint32_t size;
+  uint32_t crc;
+} OtaSlotMeta_t;
 
 static uint8_t *GetStoredImage(void)
 {
@@ -166,7 +195,8 @@ static uint8_t otaChunkLength;
 static uint16_t otaDataSeq;
 static volatile uint8_t otaTransferAborted;
 static uint8_t buttonLatched;
-static char simFirmwareUrl[192] = SIM7670_DEFAULT_URL;
+static char simApn[64] = SIM7670_APN;
+static char simFirmwareUrl[192] = SIM7670_DEFAULT_URL_B;
 static char simManifestUrl[192] = SIM7670_DEFAULT_MANIFEST_URL;
 static uint32_t simManifestVersion;
 static uint32_t simManifestSize;
@@ -203,11 +233,16 @@ static uint8_t OTA_SendDataFrame(const uint8_t *payload, uint8_t payloadLen);
 static void OTA_PollReplies(void);
 static void OTA_ClearReplies(void);
 static uint8_t OTA_TryPopReply(CAN_RxHeaderTypeDef *header, uint8_t data[8]);
+static uint8_t OTA_WaitForReplyId(uint32_t stdId, uint32_t timeoutMs, CAN_RxHeaderTypeDef *header, uint8_t data[8]);
 static uint8_t OTA_WaitForAckNack(uint32_t timeoutMs, uint8_t *code, uint32_t *value);
 static uint8_t OTA_SendFrameWithRetry(uint32_t stdId, const uint8_t *data, uint8_t dlc, uint8_t maxRetries, uint32_t timeoutMs, uint8_t ignoreProtocolNack, uint8_t *nackCode, uint32_t *nackValue);
+static uint8_t OTA_PrepareActiveSlotImageForTransfer(void);
 static void OTA_SendStoredImageOverCan(void);
 static uint8_t OTA_SendFrame(uint32_t stdId, const uint8_t *data, uint8_t dlc);
+static uint8_t OTA_QueryRxStatus(OtaRxStatus_t *status);
+static uint8_t OTA_QueryRxSlotMeta(uint8_t slot, OtaSlotMeta_t *meta);
 static int32_t SIM7670_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs);
+static void SIM7670_DrainRx(uint32_t durationMs);
 static int32_t UART2_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs);
 static uint8_t SIM7670_SendCmdExpectOk(const char *cmd, uint32_t timeoutMs);
 static uint8_t SIM7670_WaitForHttpAction(uint16_t *httpCode, uint32_t *contentLen, uint32_t timeoutMs);
@@ -218,7 +253,15 @@ static uint8_t SIM7670_ParseManifest(const uint8_t *buffer, uint32_t length, uin
 static uint8_t SIM7670_FetchManifest(void);
 static void SIM7670_PrintManifestStatus(void);
 static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expectedSize, uint32_t expectedCrc);
+static uint8_t SIM7670_SetHttpCid(void);
+static uint8_t SIM7670_CheckCpinReady(void);
+static void SIM7670_PrepareDataSession(void);
+static uint8_t SIM7670_HttpInitWithRecovery(void);
 static uint8_t SIM7670_CheckReady(void);
+static uint8_t SIM7670_TryBaud(uint32_t baud);
+static uint8_t SIM7670_WaitForRawToken(const char *token, uint32_t timeoutMs);
+static uint8_t UrlLooksHttp(const char *url);
+static void NormalizeGithubUrlInPlace(char *url, uint32_t urlSize);
 
 /* USER CODE END PFP */
 
@@ -263,6 +306,7 @@ int main(void)
   CAN_App_Init();
   Debug_PrintLine("CAN debug UART ready\r\n");
   Debug_PrintLine("CAN OTA TX node ready. NODE=" XSTR(CAN_NODE_ID) "\r\n");
+  Debug_PrintLine("FW debug: UART_CMD_DIAG_V1\r\n");
   Debug_PrintLine("UART header format: [magic OTA1][size u32 LE][crc32 u32 LE]\r\n");
   Debug_PrintLine("UART cmd 'G': download firmware via SIM7670 and store\r\n");
   Debug_PrintLine("UART cmd 'R': check SIM7670 AT response\r\n");
@@ -287,19 +331,34 @@ int main(void)
     OTA_FinalizeIfComplete();
     OTA_ProcessUartInput();
     // If user button pressed, begin sending stored image (if present)
-    if ((stored_image_size != 0U) && (otaStreamActive == 0U))
+    if (otaStreamActive == 0U)
     {
       uint8_t pressed = (UserButtonPressed() != false) ? 1U : 0U;
 
       if ((pressed != 0U) && (buttonLatched == 0U))
       {
         char line[72];
+        uint8_t status;
+
         snprintf(line, sizeof(line), "Button detected PA0=%u PC13=%u\r\n",
                  (unsigned int)HAL_GPIO_ReadPin(USER_BUTTON_GPIO_Port, USER_BUTTON_Pin),
                  (unsigned int)HAL_GPIO_ReadPin(USER_BUTTON2_GPIO_Port, USER_BUTTON2_Pin));
         Debug_PrintLine(line);
-        OTA_SendStoredImageOverCan();
         buttonLatched = 1U;
+        status = OTA_PrepareActiveSlotImageForTransfer();
+        if (status == 1U)
+        {
+          Debug_PrintLine("Prepared image for OTA. Sending over CAN...\r\n");
+          OTA_SendStoredImageOverCan();
+        }
+        else if (status == 2U)
+        {
+          Debug_PrintLine("RX already has the selected image. OTA transfer skipped.\r\n");
+        }
+        else
+        {
+          Debug_PrintLine("Active-slot-aware OTA preparation failed\r\n");
+        }
         HAL_Delay(60U);
       }
       else if (pressed == 0U)
@@ -667,7 +726,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     return;
   }
 
-  if ((header.StdId == OTA_CAN_ID_ACK) || (header.StdId == OTA_CAN_ID_NACK))
+  if ((header.StdId == OTA_CAN_ID_ACK) || (header.StdId == OTA_CAN_ID_NACK) || (header.StdId == OTA_CAN_ID_STATUS))
   {
     uint8_t wr = canRxReplyWr;
     uint8_t next = (uint8_t)((wr + 1U) % OTA_REPLY_QUEUE_LEN);
@@ -710,6 +769,35 @@ static uint8_t OTA_TryPopReply(CAN_RxHeaderTypeDef *header, uint8_t data[8])
   return 1U;
 }
 
+static uint8_t OTA_WaitForReplyId(uint32_t stdId, uint32_t timeoutMs, CAN_RxHeaderTypeDef *header, uint8_t data[8])
+{
+  uint32_t startTick = HAL_GetTick();
+
+  while ((HAL_GetTick() - startTick) < timeoutMs)
+  {
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+    if (OTA_TryPopReply(&rxHeader, rxData) == 0U)
+    {
+      continue;
+    }
+
+    if (rxHeader.StdId == stdId)
+    {
+      if (header != NULL)
+      {
+        *header = rxHeader;
+      }
+
+      memcpy(data, rxData, 8U);
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
 static void OTA_AppInit(void)
 {
   OTA_LoadStoredImageInfo();
@@ -738,6 +826,72 @@ static void OTA_LoadStoredImageInfo(void)
     stored_image_crc = 0U;
     Debug_PrintLine("No valid stored image\r\n");
   }
+}
+
+static uint8_t OTA_QueryRxStatus(OtaRxStatus_t *status)
+{
+  uint8_t cmd[1] = { OTA_QUERY_ACTIVE_STATUS };
+  CAN_RxHeaderTypeDef header;
+  uint8_t data[8];
+
+  if (status == NULL)
+  {
+    return 0U;
+  }
+
+  OTA_ClearReplies();
+  if (OTA_SendFrame(OTA_CAN_ID_QUERY, cmd, 1U) == 0U)
+  {
+    return 0U;
+  }
+
+  if (OTA_WaitForReplyId(OTA_CAN_ID_STATUS, 1000U, &header, data) == 0U)
+  {
+    return 0U;
+  }
+
+  status->activeSlot = data[0];
+  status->bootSlot = data[1];
+  status->confirmedSlot = data[2];
+  status->updateInProgress = data[3];
+  status->bootAttemptCount = data[4];
+  status->maxBootAttempts = data[5];
+  status->lastErrorCode = data[6];
+  status->metadataVersion = data[7];
+  return 1U;
+}
+
+static uint8_t OTA_QueryRxSlotMeta(uint8_t slot, OtaSlotMeta_t *meta)
+{
+  uint8_t cmd[1] = { slot };
+  CAN_RxHeaderTypeDef header;
+  uint8_t data[8];
+
+  if (meta == NULL)
+  {
+    return 0U;
+  }
+
+  OTA_ClearReplies();
+  if (OTA_SendFrame(OTA_CAN_ID_QUERY, cmd, 1U) == 0U)
+  {
+    return 0U;
+  }
+
+  if (OTA_WaitForReplyId(OTA_CAN_ID_STATUS, 1000U, &header, data) == 0U)
+  {
+    return 0U;
+  }
+
+  meta->size = ((uint32_t)data[0] << 0U) |
+               ((uint32_t)data[1] << 8U) |
+               ((uint32_t)data[2] << 16U) |
+               ((uint32_t)data[3] << 24U);
+  meta->crc = ((uint32_t)data[4] << 0U) |
+              ((uint32_t)data[5] << 8U) |
+              ((uint32_t)data[6] << 16U) |
+              ((uint32_t)data[7] << 24U);
+  return 1U;
 }
 
 static void OTA_PrintStoredImageStatus(void)
@@ -992,6 +1146,7 @@ static void OTA_FinalizeIfComplete(void)
 static void OTA_ProcessUartInput(void)
 {
   uint8_t rxByte;
+  char rxMsg[32];
 
   if ((otaStreamActive != 0U) && (otaSyncSent == 0U))
   {
@@ -1010,9 +1165,17 @@ static void OTA_ProcessUartInput(void)
     return;
   }
 
-  if (HAL_UART_Receive(&huart2, &rxByte, 1U, 0U) != HAL_OK)
+  if (HAL_UART_Receive(&huart2, &rxByte, 1U, 20U) != HAL_OK)
   {
     return;
+  }
+
+  snprintf(rxMsg, sizeof(rxMsg), "UART RX 0x%02X\r\n", (unsigned int)rxByte);
+  Debug_PrintLine(rxMsg);
+
+  if ((rxByte >= 'a') && (rxByte <= 'z'))
+  {
+    rxByte = (uint8_t)(rxByte - ('a' - 'A'));
   }
 
   if (otaStreamActive == 0U)
@@ -1090,14 +1253,22 @@ static void OTA_ProcessUartInput(void)
 
     if (rxByte == 'S')
     {
-      if (stored_image_size == 0U)
+      uint8_t status;
+
+      buttonLatched = 1U;
+      status = OTA_PrepareActiveSlotImageForTransfer();
+      if (status == 1U)
       {
-        Debug_PrintLine("No stored image. Upload first.\r\n");
+        Debug_PrintLine("Prepared image for OTA. Sending over CAN...\r\n");
+        OTA_SendStoredImageOverCan();
+      }
+      else if (status == 2U)
+      {
+        Debug_PrintLine("RX already has the selected image. OTA transfer skipped.\r\n");
       }
       else
       {
-        Debug_PrintLine("UART command S received. Starting OTA\r\n");
-        OTA_SendStoredImageOverCan();
+        Debug_PrintLine("Active-slot-aware OTA preparation failed\r\n");
       }
       return;
     }
@@ -1111,13 +1282,25 @@ static void OTA_ProcessUartInput(void)
 
     if (rxByte == 'R')
     {
-      if (SIM7670_CheckReady() != 0U)
+      uint32_t t0 = HAL_GetTick();
+      uint32_t dt;
+      uint8_t ready;
+
+      Debug_PrintLine("Checking SIM7670...\r\n");
+      ready = SIM7670_CheckReady();
+      dt = HAL_GetTick() - t0;
+
+      if (ready != 0U)
       {
-        Debug_PrintLine("SIM7670 ready\r\n");
+        char line[64];
+        snprintf(line, sizeof(line), "SIM7670 ready (%lu ms)\r\n", (unsigned long)dt);
+        Debug_PrintLine(line);
       }
       else
       {
-        Debug_PrintLine("SIM7670 not responding\r\n");
+        char line[80];
+        snprintf(line, sizeof(line), "SIM7670 not responding (%lu ms)\r\n", (unsigned long)dt);
+        Debug_PrintLine(line);
       }
       return;
     }
@@ -1125,16 +1308,28 @@ static void OTA_ProcessUartInput(void)
     if (rxByte == 'W')
     {
       char input[192];
+      char line[240];
       Debug_PrintLine("Enter firmware URL then newline:\r\n");
       if (UART2_ReadLine(input, sizeof(input), 30000U) > 0)
       {
-        strncpy(simFirmwareUrl, input, sizeof(simFirmwareUrl) - 1U);
-        simFirmwareUrl[sizeof(simFirmwareUrl) - 1U] = '\0';
-        Debug_PrintLine("Firmware URL updated\r\n");
+        if (UrlLooksHttp(input) != 0U)
+        {
+          strncpy(simFirmwareUrl, input, sizeof(simFirmwareUrl) - 1U);
+          simFirmwareUrl[sizeof(simFirmwareUrl) - 1U] = '\0';
+          NormalizeGithubUrlInPlace(simFirmwareUrl, sizeof(simFirmwareUrl));
+          snprintf(line, sizeof(line), "Firmware URL stored: %s\r\n", simFirmwareUrl);
+          Debug_PrintLine(line);
+        }
+        else
+        {
+          Debug_PrintLine("Invalid URL, keeping previous firmware URL\r\n");
+        }
       }
       else
       {
         Debug_PrintLine("URL input timeout\r\n");
+        snprintf(line, sizeof(line), "Using stored firmware URL: %s\r\n", simFirmwareUrl);
+        Debug_PrintLine(line);
       }
       return;
     }
@@ -1142,16 +1337,28 @@ static void OTA_ProcessUartInput(void)
     if (rxByte == 'T')
     {
       char input[192];
+      char line[240];
       Debug_PrintLine("Enter manifest URL then newline:\r\n");
       if (UART2_ReadLine(input, sizeof(input), 30000U) > 0)
       {
-        strncpy(simManifestUrl, input, sizeof(simManifestUrl) - 1U);
-        simManifestUrl[sizeof(simManifestUrl) - 1U] = '\0';
-        Debug_PrintLine("Manifest URL updated\r\n");
+        if (UrlLooksHttp(input) != 0U)
+        {
+          strncpy(simManifestUrl, input, sizeof(simManifestUrl) - 1U);
+          simManifestUrl[sizeof(simManifestUrl) - 1U] = '\0';
+          NormalizeGithubUrlInPlace(simManifestUrl, sizeof(simManifestUrl));
+          snprintf(line, sizeof(line), "Manifest URL stored: %s\r\n", simManifestUrl);
+          Debug_PrintLine(line);
+        }
+        else
+        {
+          Debug_PrintLine("Invalid URL, keeping previous manifest URL\r\n");
+        }
       }
       else
       {
         Debug_PrintLine("Manifest URL input timeout\r\n");
+        snprintf(line, sizeof(line), "Using stored manifest URL: %s\r\n", simManifestUrl);
+        Debug_PrintLine(line);
       }
       return;
     }
@@ -1171,29 +1378,21 @@ static void OTA_ProcessUartInput(void)
 
     if (rxByte == 'G')
     {
-      char line[240];
+      uint8_t status;
 
-      if (SIM7670_FetchManifest() != 0U)
+      status = OTA_PrepareActiveSlotImageForTransfer();
+      if (status == 1U)
       {
-        SIM7670_PrintManifestStatus();
+        Debug_PrintLine("Prepared image for OTA. Sending over CAN...\r\n");
+        OTA_SendStoredImageOverCan();
+      }
+      else if (status == 2U)
+      {
+        Debug_PrintLine("RX already has the selected image. OTA transfer skipped.\r\n");
       }
       else
       {
-        Debug_PrintLine("Manifest not available, using direct firmware URL\r\n");
-      }
-
-      snprintf(line, sizeof(line), "Downloading URL: %s\r\n", simFirmwareUrl);
-      Debug_PrintLine(line);
-      if (SIM7670_DownloadToStoredPartition(simFirmwareUrl,
-                                             (simManifestValid != 0U) ? simManifestSize : 0U,
-                                             (simManifestValid != 0U) ? simManifestCrc : 0U) != 0U)
-      {
-        Debug_PrintLine("SIM download and store complete\r\n");
-        Debug_PrintLine("Send 'S' or press button for OTA\r\n");
-      }
-      else
-      {
-        Debug_PrintLine("SIM download failed\r\n");
+        Debug_PrintLine("Active-slot-aware OTA preparation failed\r\n");
       }
       return;
     }
@@ -1289,6 +1488,7 @@ static uint8_t OTA_WaitForAckNack(uint32_t timeoutMs, uint8_t *code, uint32_t *v
 static uint8_t OTA_SendFrameWithRetry(uint32_t stdId, const uint8_t *data, uint8_t dlc, uint8_t maxRetries, uint32_t timeoutMs, uint8_t ignoreProtocolNack, uint8_t *nackCode, uint32_t *nackValue)
 {
   uint8_t attempt;
+  char line[96];
 
   OTA_ClearReplies();
 
@@ -1309,12 +1509,26 @@ static uint8_t OTA_SendFrameWithRetry(uint32_t stdId, const uint8_t *data, uint8
 
     if (result == 2U)
     {
+      if ((nackCode != NULL) && (nackValue != NULL))
+      {
+        snprintf(line, sizeof(line), "CAN NACK id=0x%03lX code=%u value=%lu\r\n",
+                 (unsigned long)stdId,
+                 (unsigned int)(*nackCode),
+                 (unsigned long)(*nackValue));
+        Debug_PrintLine(line);
+      }
+
       if ((ignoreProtocolNack != 0U) && (nackCode != NULL) && (*nackCode == 1U))
       {
         continue;
       }
       return 2U;
     }
+
+    snprintf(line, sizeof(line), "CAN ACK timeout id=0x%03lX attempt=%u\r\n",
+             (unsigned long)stdId,
+             (unsigned int)(attempt + 1U));
+    Debug_PrintLine(line);
   }
 
   return 0U;
@@ -1346,7 +1560,7 @@ static void OTA_SendStoredImageOverCan(void)
     return;
   }
 
-  Debug_PrintLine("User button pressed, sending stored image over CAN\r\n");
+  Debug_PrintLine("Starting stored image OTA over CAN\r\n");
   otaTransferAborted = 0U;
 
   if (crc == 0U)
@@ -1439,6 +1653,121 @@ static void OTA_SendStoredImageOverCan(void)
   Debug_PrintLine("Stored image OTA transfer complete\r\n");
 }
 
+static uint8_t OTA_PrepareActiveSlotImageForTransfer(void)
+{
+  char line[240];
+  uint8_t useManifest = 1U;
+  OtaRxStatus_t rxStatus;
+  OtaSlotMeta_t slotAMeta;
+  OtaSlotMeta_t slotBMeta;
+  uint8_t remoteMatchSlot = 0xFFU;
+  uint8_t queryOk = 0U;
+  const char *selectedFirmwareUrl = simFirmwareUrl;
+
+  if (UrlLooksHttp(simFirmwareUrl) == 0U)
+  {
+    strncpy(simFirmwareUrl, SIM7670_DEFAULT_URL_B, sizeof(simFirmwareUrl) - 1U);
+    simFirmwareUrl[sizeof(simFirmwareUrl) - 1U] = '\0';
+    Debug_PrintLine("Stored firmware URL invalid, restored default\r\n");
+  }
+
+  NormalizeGithubUrlInPlace(simManifestUrl, sizeof(simManifestUrl));
+  NormalizeGithubUrlInPlace(simFirmwareUrl, sizeof(simFirmwareUrl));
+
+  if (strncmp(simManifestUrl, "https://", 8U) == 0)
+  {
+    useManifest = 0U;
+    simManifestValid = 0U;
+    Debug_PrintLine("Manifest URL is HTTPS; skipping manifest fetch in HTTP-only mode\r\n");
+  }
+
+  if ((useManifest != 0U) && (SIM7670_FetchManifest() != 0U))
+  {
+    SIM7670_PrintManifestStatus();
+  }
+  else if (useManifest != 0U)
+  {
+    Debug_PrintLine("Manifest not available, using direct firmware URL\r\n");
+  }
+
+  if (OTA_QueryRxStatus(&rxStatus) == 0U)
+  {
+    Debug_PrintLine("Failed to query RX active slot\r\n");
+    return 0U;
+  }
+
+  snprintf(line, sizeof(line), "Remote active slot: %lu boot=%lu confirmed=%lu\r\n",
+           (unsigned long)rxStatus.activeSlot,
+           (unsigned long)rxStatus.bootSlot,
+           (unsigned long)rxStatus.confirmedSlot);
+  Debug_PrintLine(line);
+
+  if (rxStatus.activeSlot == OTA_SLOT_A)
+  {
+    selectedFirmwareUrl = SIM7670_DEFAULT_URL_B;
+  }
+  else if (rxStatus.activeSlot == OTA_SLOT_B)
+  {
+    selectedFirmwareUrl = SIM7670_DEFAULT_URL_A;
+  }
+  else
+  {
+    Debug_PrintLine("Unknown RX active slot\r\n");
+    return 0U;
+  }
+
+  strncpy(simFirmwareUrl, selectedFirmwareUrl, sizeof(simFirmwareUrl) - 1U);
+  simFirmwareUrl[sizeof(simFirmwareUrl) - 1U] = '\0';
+
+  snprintf(line, sizeof(line), "Selected download URL for inactive slot: %s\r\n", simFirmwareUrl);
+  Debug_PrintLine(line);
+
+  if (simManifestValid != 0U)
+  {
+    if ((OTA_QueryRxSlotMeta(OTA_QUERY_SLOT_A_META, &slotAMeta) != 0U) &&
+        (OTA_QueryRxSlotMeta(OTA_QUERY_SLOT_B_META, &slotBMeta) != 0U))
+    {
+      queryOk = 1U;
+
+      if ((slotAMeta.size == simManifestSize) && (slotAMeta.crc == simManifestCrc))
+      {
+        remoteMatchSlot = OTA_QUERY_SLOT_A_META;
+      }
+      else if ((slotBMeta.size == simManifestSize) && (slotBMeta.crc == simManifestCrc))
+      {
+        remoteMatchSlot = OTA_QUERY_SLOT_B_META;
+      }
+
+      if (remoteMatchSlot != 0xFFU)
+      {
+        snprintf(line, sizeof(line), "Remote already has matching image in Slot %c. Skipping transfer.\r\n",
+                 (remoteMatchSlot == OTA_QUERY_SLOT_A_META) ? 'A' : 'B');
+        Debug_PrintLine(line);
+        return 2U;
+      }
+
+      snprintf(line, sizeof(line), "Remote slots differ. Will transfer to inactive slot %c.\r\n",
+               (rxStatus.activeSlot == OTA_SLOT_A) ? 'B' : 'A');
+      Debug_PrintLine(line);
+    }
+  }
+
+  if ((simManifestValid != 0U) && (queryOk == 0U))
+  {
+    Debug_PrintLine("Remote slot metadata query failed, proceeding with download\r\n");
+  }
+
+  if (SIM7670_DownloadToStoredPartition(simFirmwareUrl,
+                                         (simManifestValid != 0U) ? simManifestSize : 0U,
+                                         (simManifestValid != 0U) ? simManifestCrc : 0U) != 0U)
+  {
+    return 1U;
+  }
+
+  Debug_PrintLine("Active-slot-aware download failed\r\n");
+  return 0U;
+}
+
 static int32_t SIM7670_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs)
 {
   uint32_t startTick = HAL_GetTick();
@@ -1482,6 +1811,20 @@ static int32_t SIM7670_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutM
   return -1;
 }
 
+static void SIM7670_DrainRx(uint32_t durationMs)
+{
+  uint32_t startTick = HAL_GetTick();
+  uint8_t ch;
+
+  while ((HAL_GetTick() - startTick) < durationMs)
+  {
+    if (HAL_UART_Receive(&huart3, &ch, 1U, 10U) != HAL_OK)
+    {
+      continue;
+    }
+  }
+}
+
 static int32_t UART2_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs)
 {
   uint32_t startTick = HAL_GetTick();
@@ -1500,18 +1843,14 @@ static int32_t UART2_ReadLine(char *line, uint32_t lineSize, uint32_t timeoutMs)
       continue;
     }
 
-    if (ch == '\r')
-    {
-      continue;
-    }
-
-    if (ch == '\n')
+    if ((ch == '\r') || (ch == '\n'))
     {
       if (index == 0U)
       {
         continue;
       }
       line[index] = '\0';
+      Debug_PrintLine("\r\n");
       return (int32_t)index;
     }
 
@@ -1529,7 +1868,8 @@ static uint8_t SIM7670_SendCmdExpectOk(const char *cmd, uint32_t timeoutMs)
 {
   char tx[192];
   char line[192];
-  uint32_t startTick = HAL_GetTick();
+  char dbg[224];
+  uint32_t deadline;
 
   if (cmd == NULL)
   {
@@ -1537,22 +1877,40 @@ static uint8_t SIM7670_SendCmdExpectOk(const char *cmd, uint32_t timeoutMs)
   }
 
   (void)snprintf(tx, sizeof(tx), "%s\r\n", cmd);
+  (void)snprintf(dbg, sizeof(dbg), "SIM> %s\r\n", cmd);
+  Debug_PrintLine(dbg);
+
+  /* Drop any stale modem bytes before sending next command. */
+  SIM7670_DrainRx(80U);
+
   if (HAL_UART_Transmit(&huart3, (uint8_t *)tx, (uint16_t)strlen(tx), 500U) != HAL_OK)
   {
+    Debug_PrintLine("SIM TX failed\r\n");
     return 0U;
   }
 
-  while ((HAL_GetTick() - startTick) < timeoutMs)
+  deadline = HAL_GetTick() + timeoutMs;
+  while ((int32_t)(deadline - HAL_GetTick()) > 0)
   {
-    int32_t len = SIM7670_ReadLine(line, sizeof(line), timeoutMs);
+    int32_t len = SIM7670_ReadLine(line, sizeof(line), 350U);
     if (len <= 0)
     {
       continue;
     }
 
+    (void)snprintf(dbg, sizeof(dbg), "SIM< %s\r\n", line);
+    Debug_PrintLine(dbg);
+
     if (strcmp(line, "OK") == 0)
     {
       return 1U;
+    }
+
+    /* Some firmware variants first echo command text (e.g., "AT") and then send OK later. */
+    if (strcmp(line, cmd) == 0)
+    {
+      deadline = HAL_GetTick() + timeoutMs;
+      continue;
     }
 
     if (strstr(line, "ERROR") != NULL)
@@ -1561,6 +1919,106 @@ static uint8_t SIM7670_SendCmdExpectOk(const char *cmd, uint32_t timeoutMs)
     }
   }
 
+  Debug_PrintLine("SIM cmd timeout\r\n");
+
+  return 0U;
+}
+
+static uint8_t SIM7670_SetHttpCid(void)
+{
+  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",1", SIM7670_CMD_TIMEOUT_MS) != 0U)
+  {
+    return 1U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",\"1\"", SIM7670_CMD_TIMEOUT_MS) != 0U)
+  {
+    return 1U;
+  }
+
+  Debug_PrintLine("HTTP CID=1 failed, trying CID=0\r\n");
+  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",0", SIM7670_CMD_TIMEOUT_MS) != 0U)
+  {
+    return 1U;
+  }
+
+  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",\"0\"", SIM7670_CMD_TIMEOUT_MS) != 0U)
+  {
+    return 1U;
+  }
+
+  Debug_PrintLine("HTTP CID unsupported on this FW, continuing without explicit CID\r\n");
+
+  return 1U;
+}
+
+static void SIM7670_PrepareDataSession(void)
+{
+  /* Best-effort prep across SIM76xx firmware variants. Commands may return ERROR on some builds. */
+  (void)SIM7670_SendCmdExpectOk("AT+NETCLOSE", SIM7670_HTTP_TIMEOUT_MS);
+  (void)SIM7670_SendCmdExpectOk("AT+CGATT=1", SIM7670_HTTP_TIMEOUT_MS);
+  (void)SIM7670_SendCmdExpectOk("AT+NETOPEN", SIM7670_HTTP_TIMEOUT_MS);
+  (void)SIM7670_SendCmdExpectOk("AT+NETOPEN?", SIM7670_CMD_TIMEOUT_MS);
+}
+
+static uint8_t SIM7670_HttpInitWithRecovery(void)
+{
+  if (SIM7670_SendCmdExpectOk("AT+HTTPINIT", SIM7670_CMD_TIMEOUT_MS) != 0U)
+  {
+    return 1U;
+  }
+
+  Debug_PrintLine("HTTPINIT timeout, trying NET recovery\r\n");
+  (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
+  (void)SIM7670_SendCmdExpectOk("AT+NETCLOSE", SIM7670_HTTP_TIMEOUT_MS);
+  HAL_Delay(300U);
+  (void)SIM7670_SendCmdExpectOk("AT+CGATT=1", SIM7670_HTTP_TIMEOUT_MS);
+  (void)SIM7670_SendCmdExpectOk("AT+NETOPEN", SIM7670_HTTP_TIMEOUT_MS);
+
+  return SIM7670_SendCmdExpectOk("AT+HTTPINIT", SIM7670_HTTP_TIMEOUT_MS);
+}
+
+static uint8_t SIM7670_CheckCpinReady(void)
+{
+  char tx[24];
+  char line[192];
+  char dbg[224];
+  uint32_t startTick = HAL_GetTick();
+
+  (void)snprintf(tx, sizeof(tx), "AT+CPIN?\r\n");
+  Debug_PrintLine("SIM> AT+CPIN?\r\n");
+
+  if (HAL_UART_Transmit(&huart3, (uint8_t *)tx, (uint16_t)strlen(tx), 500U) != HAL_OK)
+  {
+    Debug_PrintLine("SIM TX failed\r\n");
+    return 0U;
+  }
+
+  while ((HAL_GetTick() - startTick) < SIM7670_CMD_TIMEOUT_MS)
+  {
+    int32_t len = SIM7670_ReadLine(line, sizeof(line), 700U);
+    if (len <= 0)
+    {
+      continue;
+    }
+
+    (void)snprintf(dbg, sizeof(dbg), "SIM< %s\r\n", line);
+    Debug_PrintLine(dbg);
+
+    if (strstr(line, "+CPIN: READY") != NULL)
+    {
+      return 1U;
+    }
+
+    if ((strstr(line, "+CPIN: SIM PIN") != NULL) ||
+        (strstr(line, "+CPIN: NOT INSERTED") != NULL) ||
+        (strstr(line, "ERROR") != NULL))
+    {
+      return 0U;
+    }
+  }
+
+  Debug_PrintLine("SIM CPIN check timeout\r\n");
   return 0U;
 }
 
@@ -1712,23 +2170,22 @@ static uint8_t SIM7670_HttpGetToBuffer(const char *url, uint8_t *buffer, uint32_
     return 0U;
   }
 
-  (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", SIM7670_APN);
+  (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", simApn);
   if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
   {
     return 0U;
   }
 
+  SIM7670_PrepareDataSession();
+
   (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
-  if (SIM7670_SendCmdExpectOk("AT+HTTPINIT", SIM7670_CMD_TIMEOUT_MS) == 0U)
+
+  if (SIM7670_HttpInitWithRecovery() == 0U)
   {
     return 0U;
   }
 
-  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",1", SIM7670_CMD_TIMEOUT_MS) == 0U)
-  {
-    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
-    return 0U;
-  }
+  (void)SIM7670_SetHttpCid();
 
   (void)snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url);
   if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
@@ -1943,17 +2400,181 @@ static void SIM7670_PrintManifestStatus(void)
 
 static uint8_t SIM7670_CheckReady(void)
 {
-  if (SIM7670_SendCmdExpectOk("AT", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  static const char atPingCrlf[] = "AT\r\n";
+  char line[80];
+  uint32_t attempt;
+
+  if (SIM7670_TryBaud(SIM7670_FIXED_BAUD) != 0U)
+  {
+    return 1U;
+  }
+
+  Debug_PrintLine("SIM fixed-baud recovery path...\r\n");
+  huart3.Init.BaudRate = SIM7670_FIXED_BAUD;
+  (void)HAL_UART_DeInit(&huart3);
+  (void)HAL_UART_Init(&huart3);
+  HAL_Delay(120U);
+  SIM7670_DrainRx(120U);
+
+  for (attempt = 0U; attempt < 5U; attempt++)
+  {
+    if (HAL_UART_Transmit(&huart3, (uint8_t *)atPingCrlf, (uint16_t)(sizeof(atPingCrlf) - 1U), 250U) == HAL_OK)
+    {
+      if (SIM7670_WaitForRawToken("OK", 1400U) != 0U)
+      {
+        (void)SIM7670_SendCmdExpectOk("ATE0", 1200U);
+        Debug_PrintLine("SIM recovered at fixed baud\r\n");
+        return 1U;
+      }
+    }
+
+    HAL_Delay(150U);
+  }
+
+  snprintf(line, sizeof(line), "SIM no response at fixed baud %lu\r\n", (unsigned long)SIM7670_FIXED_BAUD);
+  Debug_PrintLine(line);
+
+  return 0U;
+}
+
+static uint8_t SIM7670_WaitForRawToken(const char *token, uint32_t timeoutMs)
+{
+  uint32_t startTick = HAL_GetTick();
+  uint8_t ch;
+  char window[8] = {0};
+  uint32_t i;
+  uint32_t tokenLen;
+
+  if (token == NULL)
   {
     return 0U;
   }
 
-  if (SIM7670_SendCmdExpectOk("ATE0", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  tokenLen = strlen(token);
+  if ((tokenLen == 0U) || (tokenLen >= sizeof(window)))
   {
     return 0U;
   }
 
-  return 1U;
+  while ((HAL_GetTick() - startTick) < timeoutMs)
+  {
+    if (HAL_UART_Receive(&huart3, &ch, 1U, 20U) != HAL_OK)
+    {
+      continue;
+    }
+
+    for (i = 0U; i < (sizeof(window) - 1U); i++)
+    {
+      window[i] = window[i + 1U];
+    }
+    window[sizeof(window) - 1U] = (char)ch;
+
+    if (strstr(window, token) != NULL)
+    {
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
+static uint8_t UrlLooksHttp(const char *url)
+{
+  if (url == NULL)
+  {
+    return 0U;
+  }
+
+  if ((strncmp(url, "http://", 7U) == 0) || (strncmp(url, "https://", 8U) == 0))
+  {
+    return 1U;
+  }
+
+  return 0U;
+}
+
+static void NormalizeGithubUrlInPlace(char *url, uint32_t urlSize)
+{
+  const char *githubPrefix = "https://github.com/";
+  const char *blobTag = "/blob/";
+  const char *repoStart;
+  const char *blobPos;
+  const char *afterBlob;
+  char out[192];
+
+  if ((url == NULL) || (urlSize < 2U))
+  {
+    return;
+  }
+
+  if (strncmp(url, githubPrefix, strlen(githubPrefix)) == 0)
+  {
+    repoStart = url + strlen(githubPrefix);
+    blobPos = strstr(repoStart, blobTag);
+    if (blobPos == NULL)
+    {
+      return;
+    }
+
+    afterBlob = blobPos + strlen(blobTag);
+    (void)snprintf(out, sizeof(out), "https://raw.githubusercontent.com/%.*s/%s",
+                   (int)(blobPos - repoStart), repoStart, afterBlob);
+
+    strncpy(url, out, urlSize - 1U);
+    url[urlSize - 1U] = '\0';
+    return;
+  }
+}
+
+static uint8_t SIM7670_TryBaud(uint32_t baud)
+{
+  static const char atPing[] = "AT\r";
+  char line[64];
+  uint32_t attempt;
+
+  huart3.Init.BaudRate = baud;
+  if (HAL_UART_DeInit(&huart3) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  snprintf(line, sizeof(line), "SIM probe baud %lu...\r\n", (unsigned long)baud);
+  Debug_PrintLine(line);
+
+  HAL_Delay(80U);
+  SIM7670_DrainRx(80U);
+
+  for (attempt = 0U; attempt < 3U; attempt++)
+  {
+    SIM7670_DrainRx(40U);
+    if (HAL_UART_Transmit(&huart3, (uint8_t *)atPing, (uint16_t)(sizeof(atPing) - 1U), 200U) == HAL_OK)
+    {
+      if (SIM7670_WaitForRawToken("OK", 1200U) != 0U)
+      {
+        (void)SIM7670_SendCmdExpectOk("ATE0", 1200U);
+        snprintf(line, sizeof(line), "SIM active baud %lu\r\n", (unsigned long)baud);
+        Debug_PrintLine(line);
+        return 1U;
+      }
+    }
+
+    if (SIM7670_SendCmdExpectOk("AT", 1800U) != 0U)
+    {
+      (void)SIM7670_SendCmdExpectOk("ATE0", 1200U);
+      snprintf(line, sizeof(line), "SIM active baud %lu\r\n", (unsigned long)baud);
+      Debug_PrintLine(line);
+      return 1U;
+    }
+
+    HAL_Delay(120U);
+  }
+
+  return 0U;
 }
 
 static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expectedSize, uint32_t expectedCrc)
@@ -1977,32 +2598,30 @@ static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expec
     return 0U;
   }
 
-  if (SIM7670_SendCmdExpectOk("AT+CPIN?", SIM7670_CMD_TIMEOUT_MS) == 0U)
+  if (SIM7670_CheckCpinReady() == 0U)
   {
     Debug_PrintLine("SIM not ready (CPIN)\r\n");
     return 0U;
   }
 
-  (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", SIM7670_APN);
+  (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", simApn);
   if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
   {
     Debug_PrintLine("SIM APN setup failed\r\n");
     return 0U;
   }
 
+  SIM7670_PrepareDataSession();
+
   (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
-  if (SIM7670_SendCmdExpectOk("AT+HTTPINIT", SIM7670_CMD_TIMEOUT_MS) == 0U)
+
+  if (SIM7670_HttpInitWithRecovery() == 0U)
   {
     Debug_PrintLine("SIM HTTPINIT failed\r\n");
     return 0U;
   }
 
-  if (SIM7670_SendCmdExpectOk("AT+HTTPPARA=\"CID\",1", SIM7670_CMD_TIMEOUT_MS) == 0U)
-  {
-    Debug_PrintLine("SIM HTTP CID failed\r\n");
-    (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
-    return 0U;
-  }
+  (void)SIM7670_SetHttpCid();
 
   (void)snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url);
   if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)

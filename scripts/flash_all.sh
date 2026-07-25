@@ -7,6 +7,7 @@ set -euo pipefail
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BOOT_DIR="$WORKSPACE_ROOT/Bootloader"
 APP_DIR="$WORKSPACE_ROOT/CAN_Rx"
+APP_SLOT_B_LD="STM32F407VGTX_FLASH_SLOT_B.ld"
 
 STM32_CLI="${STM32_CLI:-C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe}"
 if [ ! -x "$STM32_CLI" ]; then
@@ -30,15 +31,25 @@ popd >/dev/null
 echo "Building Application (CAN_Rx)..."
 pushd "$APP_DIR" >/dev/null
 make clean all
+
+if [ ! -f "$APP_SLOT_B_LD" ]; then
+  echo "Error: missing $APP_DIR/$APP_SLOT_B_LD" >&2
+  echo "Create Slot B linker script before running this automation." >&2
+  exit 4
+fi
+
+echo "Building OTA image linked for Slot B..."
+make all TARGET=CAN_Rx_slot_b LDSCRIPT="$APP_SLOT_B_LD"
 popd >/dev/null
 
 echo "Generating CAN_Rx manifest..."
 python3 "$WORKSPACE_ROOT/scripts/generate_manifest.py" \
-  --input "$APP_DIR/build/CAN_Rx.bin" \
+  --input "$APP_DIR/build/CAN_Rx_slot_b.bin" \
   --output "$APP_DIR/build/manifest.txt"
 
 BOOT_ELF="$BOOT_DIR/build/Bootloader.elf"
 APP_ELF="$APP_DIR/build/CAN_Rx.elf"
+OTA_BIN="$APP_DIR/build/CAN_Rx_slot_b.bin"
 
 if [ ! -f "$BOOT_ELF" ]; then
   BOOT_ELF="$(find "$BOOT_DIR/build" -maxdepth 1 -type f -name '*.elf' | head -n 1 || true)"
@@ -55,6 +66,7 @@ fi
 
 echo "Boot ELF: $BOOT_ELF"
 echo "App ELF:  $APP_ELF"
+echo "OTA BIN (Slot B): $OTA_BIN"
 echo "ST-LINK frequency: ${STLINK_FREQ} kHz"
 if [ -n "$STLINK_SN" ]; then
   echo "ST-LINK serial: $STLINK_SN"

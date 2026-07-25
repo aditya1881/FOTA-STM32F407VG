@@ -46,6 +46,12 @@
 #define OTA_CAN_ID_END            0x323U
 #define OTA_CAN_ID_ACK            0x324U
 #define OTA_CAN_ID_NACK           0x325U
+#define OTA_CAN_ID_QUERY          0x326U
+#define OTA_CAN_ID_STATUS         0x327U
+
+#define OTA_QUERY_ACTIVE_STATUS   0U
+#define OTA_QUERY_SLOT_A_META     1U
+#define OTA_QUERY_SLOT_B_META     2U
 
 #define OTA_SYNC_TOKEN_0          'O'
 #define OTA_SYNC_TOKEN_1          'T'
@@ -129,6 +135,8 @@ static void OTA_SelectTargetSlot(void);
 static HAL_StatusTypeDef OTA_EraseTargetSlot(void);
 static HAL_StatusTypeDef OTA_WriteChunk(uint32_t address, const uint8_t *data, uint32_t length);
 static void OTA_SendStatusFrame(uint32_t stdId, uint8_t code, uint32_t value);
+static void OTA_SendRawFrame(uint32_t stdId, const uint8_t *data, uint8_t dlc);
+static void OTA_ConfirmPendingImageEarly(void);
 
 /* USER CODE END PFP */
 
@@ -153,6 +161,9 @@ int main(void)
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
+  /* Confirm as early as possible to survive resets before full peripheral bring-up. */
+  OTA_ConfirmPendingImageEarly();
+
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
@@ -173,20 +184,6 @@ int main(void)
   Debug_PrintLine("CAN debug UART ready\r\n");
   Debug_PrintLine("Build: OTA RX\r\n");
   OTA_Init();
-  {
-    OtaMetadata_t meta;
-    if ((OtaMetadata_Load(&meta) != 0U) && (meta.updateInProgress != 0U))
-    {
-      if (OtaMetadata_ConfirmActiveImage() == HAL_OK)
-      {
-        Debug_PrintLine("Active image confirmed in metadata\r\n");
-      }
-      else
-      {
-        Debug_PrintLine("Metadata confirm failed\r\n");
-      }
-    }
-  }
   uint32_t lastAppBlinkTick = HAL_GetTick();
 
   /* USER CODE END 2 */
@@ -371,6 +368,16 @@ static void MX_GPIO_Init(void)
 static void Debug_PrintLine(const char *line)
 {
   HAL_UART_Transmit(&huart2, (uint8_t *)line, (uint16_t)strlen(line), 100U);
+}
+
+static void OTA_ConfirmPendingImageEarly(void)
+{
+  OtaMetadata_t meta;
+
+  if ((OtaMetadata_Load(&meta) != 0U) && (meta.updateInProgress != 0U))
+  {
+    (void)OtaMetadata_ConfirmActiveImage();
+  }
 }
 
 static void Debug_PrintCanFrame(const char *label, uint32_t stdId, uint32_t dlc, const uint8_t *data)
@@ -610,15 +617,7 @@ static HAL_StatusTypeDef OTA_WriteChunk(uint32_t address, const uint8_t *data, u
 
 static void OTA_SendStatusFrame(uint32_t stdId, uint8_t code, uint32_t value)
 {
-  CAN_TxHeaderTypeDef txHeader = {0};
   uint8_t payload[8];
-  uint32_t mailbox;
-
-  txHeader.StdId = stdId;
-  txHeader.IDE = CAN_ID_STD;
-  txHeader.RTR = CAN_RTR_DATA;
-  txHeader.DLC = 8U;
-  txHeader.TransmitGlobalTime = DISABLE;
 
   payload[0] = code;
   payload[1] = (uint8_t)(value >> 0U);
@@ -629,7 +628,21 @@ static void OTA_SendStatusFrame(uint32_t stdId, uint8_t code, uint32_t value)
   payload[6] = 0U;
   payload[7] = 0U;
 
-  (void)HAL_CAN_AddTxMessage(&hcan1, &txHeader, payload, &mailbox);
+  OTA_SendRawFrame(stdId, payload, 8U);
+}
+
+static void OTA_SendRawFrame(uint32_t stdId, const uint8_t *data, uint8_t dlc)
+{
+  CAN_TxHeaderTypeDef txHeader = {0};
+  uint32_t mailbox;
+
+  txHeader.StdId = stdId;
+  txHeader.IDE = CAN_ID_STD;
+  txHeader.RTR = CAN_RTR_DATA;
+  txHeader.DLC = dlc;
+  txHeader.TransmitGlobalTime = DISABLE;
+
+  (void)HAL_CAN_AddTxMessage(&hcan1, &txHeader, (uint8_t *)data, &mailbox);
 }
 
 static void OTA_ProcessIncomingFrame(void)
@@ -653,6 +666,68 @@ static void OTA_ProcessIncomingFrame(void)
   if (header.DLC > 8U)
   {
     OTA_SendStatusFrame(OTA_CAN_ID_NACK, OTA_ERR_PROTOCOL, 0U);
+    return;
+  }
+
+  if (header.StdId == OTA_CAN_ID_QUERY)
+  {
+    OtaMetadata_t metadata;
+    uint8_t payload[8] = {0};
+
+    if ((header.DLC != 1U) || (OtaMetadata_Load(&metadata) == 0U))
+    {
+      memcpy(&metadata, &gOtaMetadataDefault, sizeof(metadata));
+    }
+
+    if (header.DLC != 1U)
+    {
+      OTA_SendStatusFrame(OTA_CAN_ID_NACK, OTA_ERR_PROTOCOL, 0U);
+      return;
+    }
+
+    if (data[0] == OTA_QUERY_ACTIVE_STATUS)
+    {
+      payload[0] = (uint8_t)metadata.activeSlot;
+      payload[1] = (uint8_t)metadata.bootSlot;
+      payload[2] = (uint8_t)metadata.confirmedSlot;
+      payload[3] = (uint8_t)metadata.updateInProgress;
+      payload[4] = (uint8_t)metadata.bootAttemptCount;
+      payload[5] = (uint8_t)metadata.maxBootAttempts;
+      payload[6] = (uint8_t)metadata.lastErrorCode;
+      payload[7] = (uint8_t)metadata.metadataVersion;
+      OTA_SendRawFrame(OTA_CAN_ID_STATUS, payload, 8U);
+      return;
+    }
+
+    if (data[0] == OTA_QUERY_SLOT_A_META)
+    {
+      payload[0] = (uint8_t)(metadata.appASizeBytes >> 0U);
+      payload[1] = (uint8_t)(metadata.appASizeBytes >> 8U);
+      payload[2] = (uint8_t)(metadata.appASizeBytes >> 16U);
+      payload[3] = (uint8_t)(metadata.appASizeBytes >> 24U);
+      payload[4] = (uint8_t)(metadata.appACrc32 >> 0U);
+      payload[5] = (uint8_t)(metadata.appACrc32 >> 8U);
+      payload[6] = (uint8_t)(metadata.appACrc32 >> 16U);
+      payload[7] = (uint8_t)(metadata.appACrc32 >> 24U);
+      OTA_SendRawFrame(OTA_CAN_ID_STATUS, payload, 8U);
+      return;
+    }
+
+    if (data[0] == OTA_QUERY_SLOT_B_META)
+    {
+      payload[0] = (uint8_t)(metadata.appBSizeBytes >> 0U);
+      payload[1] = (uint8_t)(metadata.appBSizeBytes >> 8U);
+      payload[2] = (uint8_t)(metadata.appBSizeBytes >> 16U);
+      payload[3] = (uint8_t)(metadata.appBSizeBytes >> 24U);
+      payload[4] = (uint8_t)(metadata.appBCrc32 >> 0U);
+      payload[5] = (uint8_t)(metadata.appBCrc32 >> 8U);
+      payload[6] = (uint8_t)(metadata.appBCrc32 >> 16U);
+      payload[7] = (uint8_t)(metadata.appBCrc32 >> 24U);
+      OTA_SendRawFrame(OTA_CAN_ID_STATUS, payload, 8U);
+      return;
+    }
+
+    OTA_SendStatusFrame(OTA_CAN_ID_NACK, OTA_ERR_PROTOCOL, data[0]);
     return;
   }
 

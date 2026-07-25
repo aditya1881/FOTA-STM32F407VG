@@ -1,8 +1,12 @@
+build/
 Debug/
 Release/
 
 *.o
 *.d
+*.elf
+*.hex
+*.bin
 *.map
 *.list
 *.su
