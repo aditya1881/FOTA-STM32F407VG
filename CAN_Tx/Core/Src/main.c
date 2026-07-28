@@ -5,14 +5,11 @@
   * @brief          : Main program body
   ******************************************************************************
   * @attention
-  *
   * Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
-  *
   * This software is licensed under terms that can be found in the LICENSE file
   * in the root directory of this software component.
   * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -68,7 +65,7 @@
 #define OTA_SYNC_TOKEN_7          '!'
 
 #define OTA_FOOTER_MAGIC          0x454E4431U
-#define OTA_STORED_MAGIC          0x3241544FU  // 'OTA2'
+#define OTA_STORED_MAGIC          0x3241544FU  // "OTA2" in ASCII means stored image header is valid
 
 #define OTA_UART_MAGIC            0x3141544FU
 #define OTA_UART_HEADER_SIZE      12U
@@ -139,6 +136,9 @@ typedef struct
   uint32_t crc;
 } OtaSlotMeta_t;
 
+// Return the address where the stored OTA image payload begins.
+// The firmware stores a small header at the start of the OTA area,
+// so the actual image data starts immediately after that header.
 static uint8_t *GetStoredImage(void)
 {
   return (uint8_t*)(OTA_STORED_IMAGE_ADDRESS + OTA_STORED_HEADER_SIZE);
@@ -200,7 +200,7 @@ static char simFirmwareUrl[192] = SIM7670_DEFAULT_URL_B;
 static char simManifestUrl[192] = SIM7670_DEFAULT_MANIFEST_URL;
 static uint32_t simManifestVersion;
 static uint32_t simManifestSize;
-static uint32_t simManifestCrc;
+static uint32_t simManifestCrc; 
 static uint8_t simManifestValid;
 
 /* USER CODE END PV */
@@ -215,7 +215,7 @@ static void MX_USART3_UART_Init(void);
 static void CAN_App_Init(void);
 static void Debug_PrintLine(const char *line);
 static void Debug_PrintCanFrame(const char *label, uint32_t stdId, uint32_t dlc, const uint8_t *data);
-static void CAN_PrintTxStatus(void);
+static void CAN_PrintTxStatus(void); 
 static void CAN_HandleTxComplete(uint32_t txMailbox);
 static uint32_t OTA_Crc32Update(uint32_t runningCrc, uint8_t byteValue);
 static void OTA_AppInit(void);
@@ -262,7 +262,6 @@ static uint8_t SIM7670_TryBaud(uint32_t baud);
 static uint8_t SIM7670_WaitForRawToken(const char *token, uint32_t timeoutMs);
 static uint8_t UrlLooksHttp(const char *url);
 static void NormalizeGithubUrlInPlace(char *url, uint32_t urlSize);
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -313,7 +312,6 @@ int main(void)
   Debug_PrintLine("UART cmd 'W': set firmware URL\r\n");
   Debug_PrintLine("UART cmd 'T': set manifest URL\r\n");
   Debug_PrintLine("UART cmd 'M': fetch manifest (version,size,crc,url)\r\n");
-
   OTA_AppInit();
 
   /* USER CODE END 2 */
@@ -323,14 +321,15 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
     CAN_PrintTxStatus();
     OTA_PollReplies();
     OTA_FlushDataChunkIfReady();
     OTA_FinalizeIfComplete();
     OTA_ProcessUartInput();
+
     // If user button pressed, begin sending stored image (if present)
+
     if (otaStreamActive == 0U)
     {
       uint8_t pressed = (UserButtonPressed() != false) ? 1U : 0U;
@@ -367,6 +366,7 @@ int main(void)
       }
     }
   }
+
   /* USER CODE END 3 */
 }
 
@@ -613,12 +613,23 @@ static void CAN_App_Init(void)
     Error_Handler();
   }
 
-  canTxHeader.StdId = CAN_TX_STD_ID;
-  canTxHeader.ExtId = 0x00;
-  canTxHeader.IDE = CAN_ID_STD;
-  canTxHeader.RTR = CAN_RTR_DATA;
-  canTxHeader.DLC = 8;
+  canTxHeader.StdId = CAN_TX_STD_ID;// standard id
+  canTxHeader.ExtId = 0x00;// no ext id is used
+  canTxHeader.IDE = CAN_ID_STD; // std id 
+  canTxHeader.RTR = CAN_RTR_DATA; // data frame
+  canTxHeader.DLC = 8; // data length code
   canTxHeader.TransmitGlobalTime = DISABLE;
+
+  /* CAN Tx Header fields:
+   * StdId: Standard (11-bit) Identifier used when IDE == CAN_ID_STD.
+   * ExtId: Extended (29-bit) Identifier used when IDE == CAN_ID_EXT.
+   * IDE: Identifier type (CAN_ID_STD or CAN_ID_EXT) selects StdId or ExtId.
+   * RTR: Remote Transmission Request (CAN_RTR_DATA for data frame,
+   *      CAN_RTR_REMOTE for remote frame requesting data).
+   * DLC: Data Length Code - number of data bytes in the CAN frame (0..8 for classic CAN).
+   * TransmitGlobalTime: If ENABLE, requests controller to append/get global time (for some hardware);
+   *    typically DISABLE for normal transmissions.
+   */
 }
 
 static void CAN_PrintTxStatus(void)
@@ -648,6 +659,14 @@ static void CAN_PrintTxStatus(void)
   }
 }
 
+
+/*
+* CAN_HandleTxComplete()
+* @param : txMailbox - the mailbox number (0, 1, or 2) that completed transmission
+* @brief : This function is called when a CAN transmission completes successfully. 
+* It sets the canTxAckMailbox variable to the completed mailbox number, sets the canTxAckPending flag to indicate that an acknowledgment has been received, and toggles the LED_RX_Pin to provide visual feedback of the successful transmission.
+
+*/
 static void CAN_HandleTxComplete(uint32_t txMailbox)
 {
   canTxAckMailbox = txMailbox;
@@ -798,12 +817,25 @@ static uint8_t OTA_WaitForReplyId(uint32_t stdId, uint32_t timeoutMs, CAN_RxHead
   return 0U;
 }
 
+/*
+* OTA_AppInit()
+* @param : None
+* @brief : This function initializes the OTA application by loading any stored image information and resetting the OTA session state.
+*/
 static void OTA_AppInit(void)
 {
   OTA_LoadStoredImageInfo();
   OTA_ResetSession();
 }
 
+/*
+* OTA_LoadStoredImageInfo()
+* @param : None
+* @brief : This function loads the stored image information from the designated memory location.
+* It checks the validity of the stored image header by verifying the magic number, size, and CRC.
+* If valid, it updates the stored image size and CRC variables and prints relevant information to the debug UART. 
+* If invalid, it resets the stored image size and CRC to zero and indicates that no valid stored image is present.
+*/
 static void OTA_LoadStoredImageInfo(void)
 {
   const OtaStoredHeader_t *hdr = (const OtaStoredHeader_t *)OTA_STORED_IMAGE_ADDRESS;
@@ -828,6 +860,12 @@ static void OTA_LoadStoredImageInfo(void)
   }
 }
 
+/*
+* OTA_QueryRxStatus()
+* @param : status - Pointer to the structure to store the received status information
+* @brief : This function queries the receive status of the OTA module. It sends a query command over CAN and waits for a reply with the status information.
+* If successful, it populates the provided status structure with the received data and returns 1. If unsuccessful, it returns 0.
+*/
 static uint8_t OTA_QueryRxStatus(OtaRxStatus_t *status)
 {
   uint8_t cmd[1] = { OTA_QUERY_ACTIVE_STATUS };
@@ -861,6 +899,13 @@ static uint8_t OTA_QueryRxStatus(OtaRxStatus_t *status)
   return 1U;
 }
 
+
+/*
+* OTA_QueryRxSlotMeta()
+* @param : slot - The slot number to query (0 or 1)
+* @brief : This function queries the metadata of a specific slot in the OTA module. It sends a query command over CAN with the specified slot number and waits for a reply containing the metadata information.
+* If successful, it populates the provided meta structure with the received data (size and CRC) and returns 1. If unsuccessful, it returns 0.
+*/
 static uint8_t OTA_QueryRxSlotMeta(uint8_t slot, OtaSlotMeta_t *meta)
 {
   uint8_t cmd[1] = { slot };
@@ -893,7 +938,12 @@ static uint8_t OTA_QueryRxSlotMeta(uint8_t slot, OtaSlotMeta_t *meta)
               ((uint32_t)data[7] << 24U);
   return 1U;
 }
+/*
+* OTA_PrintStoredImageStatus()
+* @param : None
+* @brief : This function prints the status of the stored image, including its size and CRC, to the debug UART. It formats the information into a string and sends it for debugging purposes.
 
+*/
 static void OTA_PrintStoredImageStatus(void)
 {
   char msg[96];
@@ -920,6 +970,12 @@ static void OTA_ResetSession(void)
   buttonLatched = 0U;
 }
 
+/*
+* OTA_SendSyncFrame()
+* @param : None
+* @brief : This function sends a synchronization frame over CAN to initiate the OTA process. 
+* It constructs a payload containing the synchronization tokens and sends it using the OTA_SendFrame function.
+*/
 static void OTA_SendSyncFrame(void)
 {
   uint8_t payload[8] =
@@ -940,7 +996,18 @@ static void OTA_SendSyncFrame(void)
     Debug_PrintLine("OTA SYNC sent\r\n");
   }
 }
-
+/*
+* OTA_SendFrame()
+* @param : stdId - The standard identifier for the CAN frame
+* @param : data - Pointer to the data payload to be sent
+* @param : dlc - The data length code (number of bytes in the payload)
+* @return : 1 if the frame was sent successfully, 0 otherwise
+* @brief : This function sends a CAN frame with the specified standard identifier, data payload, and data length code.
+* It first checks if there are free mailboxes available for transmission.
+* If a mailbox is available, it prepares the CAN header and data, and attempts to send the frame using HAL_CAN_AddTxMessage.
+* If the transmission is successful, it toggles the LED_TX_Pin to indicate a successful transmission and prints the transmitted frame details to the debug UART.
+* If the transmission fails or no mailboxes are available, it returns 0 to indicate failure.
+*/
 static uint8_t OTA_SendFrame(uint32_t stdId, const uint8_t *data, uint8_t dlc)
 {
   canTxHeader.StdId = stdId;
@@ -955,7 +1022,7 @@ static uint8_t OTA_SendFrame(uint32_t stdId, const uint8_t *data, uint8_t dlc)
 
   if (HAL_CAN_AddTxMessage(&hcan1, &canTxHeader, canTxData, &canTxMailbox) == HAL_OK)
   {
-    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_TX_Pin);
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_TX_Pin);//toggle TX LED to indicate a successful transmission
     Debug_PrintCanFrame("TX", canTxHeader.StdId, canTxHeader.DLC, canTxData);
     return 1U;
   }
@@ -963,6 +1030,13 @@ static uint8_t OTA_SendFrame(uint32_t stdId, const uint8_t *data, uint8_t dlc)
   return 0U;
 }
 
+/*  
+* OTA_Crc32Update()
+* @param : runningCrc - The current CRC value to be updated fetched from the binary data of the OTA image
+* @param : byteValue - The byte value to be processed
+* @return : The updated CRC value
+* @brief : This function updates the CRC value with the given byte value using the CRC32 algorithm.
+*/
 static uint32_t OTA_Crc32Update(uint32_t runningCrc, uint8_t byteValue)
 {
   uint32_t crc = runningCrc ^ byteValue;
@@ -977,6 +1051,12 @@ static uint32_t OTA_Crc32Update(uint32_t runningCrc, uint8_t byteValue)
   return crc;
 }
 
+/*
+* OTA_SendStartFrame()
+* @param : None 
+* @brief : This function sends a start frame over CAN to indicate the beginning of the OTA process.
+* It constructs a payload containing the expected size and CRC of the OTA image, and sends it using the OTA_SendFrame function.
+*/
 static void OTA_SendStartFrame(void)
 {
   uint8_t payload[8];
@@ -996,7 +1076,13 @@ static void OTA_SendStartFrame(void)
     Debug_PrintLine("OTA START sent\r\n");
   }
 }
-
+/*
+* OTA_SendEndFrame()
+* @param : None
+* @brief : This function sends an end frame over CAN to indicate the completion of the OTA process.
+* It constructs a payload containing the OTA footer magic number and the expected size of the OTA image, and sends it using the OTA_SendFrame function.
+* If the frame is sent successfully, it sets the otaEndSent flag to indicate that the end frame has been sent and prints a debug message.
+*/
 static void OTA_SendEndFrame(void)
 {
   uint8_t payload[8];
@@ -1017,11 +1103,23 @@ static void OTA_SendEndFrame(void)
   }
 }
 
+/*
+* OTA_SendDataFrame()
+* @param : payload - Pointer to the data payload to be sent
+* @param : payloadLen - The length of the data payload
+* @return : 1 if the data frame was sent successfully, 0 otherwise
+* @brief : This function sends a data frame over CAN containing a portion of the OTA image data.
+* It constructs a frame with the sequence number and the provided payload, and sends it using the
+* OTA_SendFrame function. The sequence number is incremented after each successful transmission.
+*/
 static uint8_t OTA_SendDataFrame(const uint8_t *payload, uint8_t payloadLen)
 {
-  uint8_t frame[8];
+  uint8_t frame[8]; 
+  // OTA data frame is 8 bytes: 2 bytes for sequence number and 6 bytes for payload 
+  //payload: means the actual data being sent in the OTA data frame
+  //sequence number: means the order of the data frame in the OTA transfer, used to ensure that the receiver can reconstruct the original data correctly
 
-  if ((payload == NULL) || (payloadLen == 0U) || (payloadLen > OTA_DATA_PAYLOAD_SIZE))
+  if ((payload == NULL) || (payloadLen == 0U) || (payloadLen > OTA_DATA_PAYLOAD_SIZE)) // Validate payload length and not null pointer and not zero length
   {
     return 0U;
   }
@@ -1031,15 +1129,22 @@ static uint8_t OTA_SendDataFrame(const uint8_t *payload, uint8_t payloadLen)
   memset(&frame[2], 0, OTA_DATA_PAYLOAD_SIZE);
   memcpy(&frame[2], payload, payloadLen);
 
-  if (OTA_SendFrame(OTA_CAN_ID_DATA, frame, (uint8_t)(payloadLen + OTA_DATA_SEQ_BYTES)) == 0U)
+  if (OTA_SendFrame(OTA_CAN_ID_DATA, frame, (uint8_t)(payloadLen + OTA_DATA_SEQ_BYTES)) == 0U) // return 0 if sending the frame failed
   {
     return 0U;
   }
 
-  otaDataSeq++;
+  otaDataSeq++; //at extreme last the seqnum == total number of data frames sent, so that the receiver can know how many frames to expect
   return 1U;
 }
 
+/*
+* OTA_ParseHeaderAndStart()
+* @param : None
+* @brief : This function parses the OTA header and starts the OTA transfer.
+* It checks the magic number, expected size, and expected CRC from the received header.
+* If the header is valid, it initializes the OTA transfer state and sends a synchronization frame to the receiver to indicate the start of the OTA process. If the header is invalid, it resets the OTA session.
+*/
 static void OTA_ParseHeaderAndStart(void)
 {
   uint32_t magic = ((uint32_t)otaHeaderBuffer[0] << 0U) |
@@ -1069,6 +1174,8 @@ static void OTA_ParseHeaderAndStart(void)
     OTA_ResetSession();
     return;
   }
+//after parsing the header, set the otaStreamActive flag to indicate that the OTA transfer is active,
+// reset the header index, running CRC, received size, chunk length, and flags for sync, start, and end frames.
 
   otaStreamActive = 1U;
   otaHeaderIndex = 0U;
@@ -1079,9 +1186,15 @@ static void OTA_ParseHeaderAndStart(void)
   otaStartSent = 0U;
   otaEndSent = 0U;
   Debug_PrintLine("UART OTA stream accepted\r\n");
-  OTA_SendSyncFrame();
+  OTA_SendSyncFrame(); //after parsing the header, send a sync frame to the receiver to indicate that the OTA transfer is starting
 }
 
+/*
+ * OTA_FlushDataChunkIfReady()
+ * @param None
+ * @brief Flushes the data chunk if it is ready to be sent.
+ * 
+ */
 static void OTA_FlushDataChunkIfReady(void)
 {
   if ((otaStreamActive == 0U) || (otaSyncSent == 0U) || (otaStartSent == 0U))
@@ -1093,11 +1206,20 @@ static void OTA_FlushDataChunkIfReady(void)
   {
     if (OTA_SendDataFrame(otaChunkBuffer, otaChunkLength) != 0U)
     {
-      otaChunkLength = 0U;
+      otaChunkLength = 0U; //reset the chunk length to 0 after successfully sending the data frame
     }
   }
 }
 
+/*
+ * OTA_FinalizeIfComplete()
+ * @param None
+ * @brief Finalizes the OTA transfer if it is complete.
+ * by checking if the received size matches the expected size, and if the running CRC matches the expected CRC.
+ * If both conditions are met, it sends an end frame to indicate the completion of the OTA transfer. 
+ * If the CRC does not match, it resets the OTA session and indicates an error.
+ * 
+ */
 static void OTA_FinalizeIfComplete(void)
 {
   uint32_t finalCrc;
@@ -1143,6 +1265,17 @@ static void OTA_FinalizeIfComplete(void)
   OTA_ResetSession();
 }
 
+/*
+ * OTA_ProcessUartInput()
+ * @param None
+ * @brief Processes incoming UART data for OTA updates.
+ * then checks if the OTA stream is active and whether the sync and start frames have been sent.
+ * If the OTA stream is active and the sync frame has not been sent, it sends the sync frame. 
+ * If the OTA stream is active and the start frame has not been sent, it sends the start frame.
+ * If the OTA stream is active and the chunk length is equal to the maximum payload size, it returns without processing further data.
+ * If there is data available on the UART, it reads a byte and processes it.
+ * 
+ */
 static void OTA_ProcessUartInput(void)
 {
   uint8_t rxByte;
@@ -1207,7 +1340,7 @@ static void OTA_ProcessUartInput(void)
       uint8_t tmpBuf[128];
       while (remaining)
       {
-        uint32_t toRead = (remaining > sizeof(tmpBuf)) ? sizeof(tmpBuf) : remaining;
+        uint32_t toRead = (remaining > sizeof(tmpBuf)) ? sizeof(tmpBuf) : remaining ;
         if (HAL_UART_Receive(&huart2, tmpBuf, toRead, 5000U) != HAL_OK)
         {
           Debug_PrintLine("UART receive timeout during image upload\r\n");
@@ -1259,6 +1392,7 @@ static void OTA_ProcessUartInput(void)
       status = OTA_PrepareActiveSlotImageForTransfer();
       if (status == 1U)
       {
+        
         Debug_PrintLine("Prepared image for OTA. Sending over CAN...\r\n");
         OTA_SendStoredImageOverCan();
       }
@@ -1268,15 +1402,15 @@ static void OTA_ProcessUartInput(void)
       }
       else
       {
-        Debug_PrintLine("Active-slot-aware OTA preparation failed\r\n");
+        Debug_PrintLine("Active-slot-aware OTA preparation failed\r\n"); // it knows that the stored image is invalid or not present, so it cannot prepare for OTA transfer
       }
       return;
     }
 
     if (rxByte == 'Q')
     {
-      OTA_LoadStoredImageInfo();
-      OTA_PrintStoredImageStatus();
+      OTA_LoadStoredImageInfo();// reload the stored image info from flash, in case it was updated by a previous upload
+      OTA_PrintStoredImageStatus();// print the stored image status to the debug UART like size and CRC
       return;
     }
 
@@ -1415,6 +1549,13 @@ static void OTA_ProcessUartInput(void)
   otaReceivedSize++;
 }
 
+/*
+ * OTA_PollReplies()
+ * @param None
+ * @brief Polls for replies from the OTA receiver over CAN.
+ * It checks for ACK or NACK messages and handles them accordingly.
+ * If a NACK is received, it resets the OTA session and indicates an error.
+ */
 static void OTA_PollReplies(void)
 {
   CAN_RxHeaderTypeDef header;
@@ -1443,7 +1584,16 @@ static void OTA_PollReplies(void)
     OTA_ResetSession();
   }
 }
-
+/*
+ * OTA_WaitForAckNack()
+ * @param timeoutMs - The timeout in milliseconds to wait for an ACK or NACK response
+ * @param code - Pointer to store the received code (if any)
+ * @param value - Pointer to store the received value (if any)
+ * @return 1 if ACK received, 2 if NACK received, 0 if timeout occurred
+ * @brief Waits for an ACK or NACK response from the OTA receiver over CAN.
+ * It polls for replies until either an ACK or NACK is received or the timeout expires.
+ * If a reply is received, it extracts the code and value from the data and returns the appropriate status.
+ */
 static uint8_t OTA_WaitForAckNack(uint32_t timeoutMs, uint8_t *code, uint32_t *value)
 {
   uint32_t startTick = HAL_GetTick();
@@ -1484,7 +1634,21 @@ static uint8_t OTA_WaitForAckNack(uint32_t timeoutMs, uint8_t *code, uint32_t *v
 
   return 0U;
 }
-
+/*
+ * OTA_SendFrameWithRetry()
+ * @param stdId - The standard identifier for the CAN frame
+ * @param data - Pointer to the data payload to be sent
+ * @param dlc - The data length code (number of bytes in the payload)
+ * @param maxRetries - The maximum number of retries for sending the frame
+ * @param timeoutMs - The timeout in milliseconds to wait for an ACK or NACK response
+ * @param ignoreProtocolNack - Flag to indicate whether to ignore protocol NACKs (1 to ignore, 0 to not ignore)
+ * @param nackCode - Pointer to store the received NACK code (if any)
+ * @param nackValue - Pointer to store the received NACK value (if any)
+ * @return 1 if ACK received, 2 if NACK received, 0 if all retries failed
+ * @brief Sends a CAN frame with retries and waits for an ACK or NACK response.
+ * It attempts to send the frame up to maxRetries times, waiting for an ACK or NACK after each attempt.
+ * If an ACK is received, it returns 1. If a NACK is received, it returns 2. If all retries fail, it returns 0.
+ */
 static uint8_t OTA_SendFrameWithRetry(uint32_t stdId, const uint8_t *data, uint8_t dlc, uint8_t maxRetries, uint32_t timeoutMs, uint8_t ignoreProtocolNack, uint8_t *nackCode, uint32_t *nackValue)
 {
   uint8_t attempt;
@@ -1533,7 +1697,13 @@ static uint8_t OTA_SendFrameWithRetry(uint32_t stdId, const uint8_t *data, uint8
 
   return 0U;
 }
-
+/*
+ * OTA_SendStoredImageOverCan()
+ * @param None
+ * @brief Sends the stored OTA image over CAN to the receiver.
+ * It retrieves the stored image, calculates its CRC if not already done, and sends it in chunks over CAN.
+ * The function handles synchronization, start, data, and end frames, and manages retries and acknowledgments.
+ */
 static void OTA_SendStoredImageOverCan(void)
 {
   uint8_t *img = GetStoredImage();
@@ -1616,7 +1786,7 @@ static void OTA_SendStoredImageOverCan(void)
       continue;
     }
 
-    if ((status == 2U) && (nackCode == 1U))
+    if ((status == 2U) && (nackCode == 1U)) 
     {
       uint16_t expectedSeq = (uint16_t)(nackValue & 0xFFFFU);
       if (expectedSeq > seq)
@@ -1653,6 +1823,15 @@ static void OTA_SendStoredImageOverCan(void)
   Debug_PrintLine("Stored image OTA transfer complete\r\n");
 }
 
+/*
+ * OTA_PrepareActiveSlotImageForTransfer()
+ * @param None
+ * @return 1 if preparation successful, 0 if failed
+ * @brief Prepares the active slot image for OTA transfer.
+ * It checks the status of the active slot and prepares the appropriate firmware URL for download.
+ * like it check then download Slot A or Slot B firmware based on the active slot of the receiver.
+ * It also checks if the remote already has a matching image and skips transfer if so.
+ */
 static uint8_t OTA_PrepareActiveSlotImageForTransfer(void)
 {
   char line[240];
@@ -1702,11 +1881,11 @@ static uint8_t OTA_PrepareActiveSlotImageForTransfer(void)
            (unsigned long)rxStatus.confirmedSlot);
   Debug_PrintLine(line);
 
-  if (rxStatus.activeSlot == OTA_SLOT_A)
+  if (rxStatus.activeSlot == OTA_SLOT_A) // if slot A active -> download to slot B
   {
     selectedFirmwareUrl = SIM7670_DEFAULT_URL_B;
   }
-  else if (rxStatus.activeSlot == OTA_SLOT_B)
+  else if (rxStatus.activeSlot == OTA_SLOT_B) // if slot B active -> download to slot A
   {
     selectedFirmwareUrl = SIM7670_DEFAULT_URL_A;
   }
@@ -1719,10 +1898,10 @@ static uint8_t OTA_PrepareActiveSlotImageForTransfer(void)
   strncpy(simFirmwareUrl, selectedFirmwareUrl, sizeof(simFirmwareUrl) - 1U);
   simFirmwareUrl[sizeof(simFirmwareUrl) - 1U] = '\0';
 
-  snprintf(line, sizeof(line), "Selected download URL for inactive slot: %s\r\n", simFirmwareUrl);
+  snprintf(line, sizeof(line), "Selected download URL for inactive slot: %s\r\n", simFirmwareUrl);//prints string stored in simFirmwareUrl to the debug UART
   Debug_PrintLine(line);
 
-  if (simManifestValid != 0U)
+  if (simManifestValid != 0U) 
   {
     if ((OTA_QueryRxSlotMeta(OTA_QUERY_SLOT_A_META, &slotAMeta) != 0U) &&
         (OTA_QueryRxSlotMeta(OTA_QUERY_SLOT_B_META, &slotBMeta) != 0U))
@@ -1738,7 +1917,7 @@ static uint8_t OTA_PrepareActiveSlotImageForTransfer(void)
         remoteMatchSlot = OTA_QUERY_SLOT_B_META;
       }
 
-      if (remoteMatchSlot != 0xFFU)
+      if (remoteMatchSlot != 0xFFU) //0xFFU indicates that no matching slot was found
       {
         snprintf(line, sizeof(line), "Remote already has matching image in Slot %c. Skipping transfer.\r\n",
                  (remoteMatchSlot == OTA_QUERY_SLOT_A_META) ? 'A' : 'B');
@@ -1758,10 +1937,10 @@ static uint8_t OTA_PrepareActiveSlotImageForTransfer(void)
   }
 
   if (SIM7670_DownloadToStoredPartition(simFirmwareUrl,
-                                         (simManifestValid != 0U) ? simManifestSize : 0U,
-                                         (simManifestValid != 0U) ? simManifestCrc : 0U) != 0U)
+                                         (simManifestValid != 0U) ? simManifestSize : 0U,//if the manifest is valid, use the size from the manifest; otherwise, use 0
+                                         (simManifestValid != 0U) ? simManifestCrc : 0U) != 0U) //if the simManifestValid is true, use the CRC from the manifest; otherwise, use 0
   {
-    return 1U;
+    return 1U; // indicates that the download was successful and the image is ready for OTA transfer 
   }
 
   Debug_PrintLine("Active-slot-aware download failed\r\n");
@@ -2165,9 +2344,9 @@ static uint8_t SIM7670_HttpGetToBuffer(const char *url, uint8_t *buffer, uint32_
     return 0U;
   }
 
-  if (SIM7670_CheckReady() == 0U)
+  if (SIM7670_CheckReady() == 0U)//
   {
-    return 0U;
+    return 0U; //not ready 
   }
 
   (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", simApn);
@@ -2406,7 +2585,7 @@ static uint8_t SIM7670_CheckReady(void)
 
   if (SIM7670_TryBaud(SIM7670_FIXED_BAUD) != 0U)
   {
-    return 1U;
+    return 1U;//if the SIM responds at the fixed baud rate, return 1 (ready)
   }
 
   Debug_PrintLine("SIM fixed-baud recovery path...\r\n");
@@ -2576,21 +2755,32 @@ static uint8_t SIM7670_TryBaud(uint32_t baud)
 
   return 0U;
 }
-
+/**
+* SIM7670_DownloadToStoredPartition()
+* @param url: The URL to download the firmware image from.
+* @param expectedSize: The expected size of the firmware image. If 0, size check is skipped.
+* @param expectedCrc: The expected CRC32 of the firmware image. If 0, CRC check is skipped.
+* @return: 1 if the download and verification were successful, 0 otherwise.
+* this fun does every thing needed to download a firmware image from a given URL(function: SIM7670_PrepareDataSession) and store it in the designated flash partition(function: SIM7670_EraseFlash ). 
+* It handles HTTP communication(function: SIM7670_HttpInitWithRecovery ), flash erasure(function: SIM7670_EraseFlash ), writing, and CRC verification. 
+* 
+*/
 static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expectedSize, uint32_t expectedCrc)
 {
   char cmd[256];
   uint16_t httpCode = 0U;
   uint32_t contentLen = 0U;
   uint32_t offset = 0U;
-  uint32_t writeAddress = OTA_STORED_IMAGE_ADDRESS + OTA_STORED_HEADER_SIZE;
+  uint32_t writeAddress = OTA_STORED_IMAGE_ADDRESS + OTA_STORED_HEADER_SIZE; // writeAddress:The firmware image will be written starting from address 0x08041000 in flash memory of the microcontroller. 
+  //The first 0x1000 bytes (4KB) of the OTA_STORED_IMAGE_ADDRESS are reserved for the OTA header, which contains metadata about the firmware image, such as its size, version, and CRC. 
+  ///The actual firmware image is written after this header.
   uint32_t runningCrc = 0xFFFFFFFFU;
 
   if ((url == NULL) || (url[0] == '\0'))
   {
     Debug_PrintLine("SIM URL empty\r\n");
     return 0U;
-  }
+  } 
 
   if (SIM7670_CheckReady() == 0U)
   {
@@ -2605,13 +2795,13 @@ static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expec
   }
 
   (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", simApn);
-  if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)
+  if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U) 
   {
     Debug_PrintLine("SIM APN setup failed\r\n");
     return 0U;
   }
 
-  SIM7670_PrepareDataSession();
+  SIM7670_PrepareDataSession(); 
 
   (void)SIM7670_SendCmdExpectOk("AT+HTTPTERM", SIM7670_CMD_TIMEOUT_MS);
 
@@ -2621,7 +2811,7 @@ static uint8_t SIM7670_DownloadToStoredPartition(const char *url, uint32_t expec
     return 0U;
   }
 
-  (void)SIM7670_SetHttpCid();
+  (void)SIM7670_SetHttpCid(); 
 
   (void)snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url);
   if (SIM7670_SendCmdExpectOk(cmd, SIM7670_CMD_TIMEOUT_MS) == 0U)

@@ -3,8 +3,8 @@
 
 static uint32_t FLASH_If_GetSector(uint32_t address)
 {
-    if (address < 0x08004000U) return FLASH_SECTOR_0;
-    if (address < 0x08008000U) return FLASH_SECTOR_1;
+    if (address < 0x08004000U) return FLASH_SECTOR_0; // 0x08004000U - 0x08008000U = 16KB
+    if (address < 0x08008000U) return FLASH_SECTOR_1; // 0x08008000U - 0x0800C000U = 16KB
     if (address < 0x0800C000U) return FLASH_SECTOR_2;
     if (address < 0x08010000U) return FLASH_SECTOR_3;
     if (address < 0x08020000U) return FLASH_SECTOR_4;
@@ -48,7 +48,13 @@ int FLASH_If_Erase(uint32_t addr, uint32_t size)
     HAL_FLASH_Lock();
     return 0;
 }
-
+/**
+ * @brief  Writes data to flash memory.
+ * @param  addr: Start address in flash memory where data will be written.
+ * @param  data: Pointer to the data to be written.
+ * @param  size: Number of bytes to write.
+ * @retval int: 0 on success, -1 on failure.
+ */
 int FLASH_If_Write(uint32_t addr, const uint8_t *data, uint32_t size)
 {
     uint32_t p;
