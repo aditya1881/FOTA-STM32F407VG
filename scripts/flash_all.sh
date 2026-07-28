@@ -43,9 +43,19 @@ make all TARGET=CAN_Rx_slot_b LDSCRIPT="$APP_SLOT_B_LD"
 popd >/dev/null
 
 echo "Generating CAN_Rx manifest..."
-python3 "$WORKSPACE_ROOT/scripts/generate_manifest.py" \
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=python
+else
+  echo "Error: python3/python not found in PATH" >&2
+  exit 2
+fi
+
+"$PYTHON_BIN" "$WORKSPACE_ROOT/scripts/generate_manifest.py" \
   --input "$APP_DIR/build/CAN_Rx_slot_b.bin" \
-  --output "$APP_DIR/build/manifest.txt"
+  --output "$APP_DIR/build/manifest.txt" \
+  --slot B
 
 BOOT_ELF="$BOOT_DIR/build/Bootloader.elf"
 APP_ELF="$APP_DIR/build/CAN_Rx.elf"

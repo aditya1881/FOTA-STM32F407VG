@@ -89,10 +89,13 @@
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
-
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+
+//===================================
+
+//===================================
 static volatile uint8_t canRxDebugPending;
 static CAN_RxHeaderTypeDef canRxDebugHeader;
 static uint8_t canRxDebugData[8];
@@ -184,7 +187,12 @@ int main(void)
   Debug_PrintLine("CAN debug UART ready\r\n");
   Debug_PrintLine("Build: OTA RX\r\n");
   OTA_Init();
-  uint32_t lastAppBlinkTick = HAL_GetTick();
+  uint32_t lastAppBlinkTick = HAL_GetTick();  
+  HAL_UART_Transmit(&huart2, (uint8_t *)"GPIO_PIN_15 Blinking SLOT B\r\n",30U,100U);
+
+ //========================================================================
+
+//=======================================================
 
   /* USER CODE END 2 */
 
@@ -200,8 +208,14 @@ int main(void)
     if ((HAL_GetTick() - lastAppBlinkTick) >= 1000U)
     {
       lastAppBlinkTick += 1000U;
-      // HAL_GPIO_TogglePin(LED_GPIO_Port, LED_RX_Pin);
-      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_TX_Pin);
+     
+      // HAL_GPIO_TogglePin(LED_GPIO_Port, LED_TX_Pin);
+      // HAL_GPIO_TogglePin(LED_GPIO_Port, GPIO_PIN_13);
+      // HAL_GPIO_TogglePin(LED_GPIO_Port, GPIO_PIN_14);
+      HAL_GPIO_TogglePin(LED_GPIO_Port, GPIO_PIN_15);
+      HAL_Delay(50);
+
+
     }
     // if ((HAL_GetTick() - lastRxStatusTick) >= 2000U)
     // {
@@ -214,6 +228,9 @@ int main(void)
       HAL_Delay(20U);
       NVIC_SystemReset();
     }
+//=====================================================================================================
+
+//==========================================================================
   }
   /* USER CODE END 3 */
 }
@@ -339,10 +356,14 @@ static void MX_USART2_UART_Init(void)
   * @param None
   * @retval None
   */
+
+
+
 static void MX_GPIO_Init(void)
 {
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
+  /* Enable GPIOE clock for CS pin */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
@@ -353,15 +374,14 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  GPIO_InitStruct.Pin = LED_TX_Pin|LED_RX_Pin|LED_ERROR_Pin;
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_12;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LED_GPIO_Port, &GPIO_InitStruct);
 
-  HAL_GPIO_WritePin(LED_GPIO_Port, LED_TX_Pin|LED_RX_Pin|LED_ERROR_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_GPIO_Port, GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_12, GPIO_PIN_RESET);
 
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -486,6 +506,8 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan)
   if (hcan->Instance == CAN1)
   {
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_ERROR_Pin);
+
+  
   }
 }
 
